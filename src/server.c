@@ -11,6 +11,7 @@
 #include <linux/sockios.h>
 #include <ifaddrs.h>
 #include "neighborshow.h"
+#include "ospf_common.h"
 
 #define MAX_REQUESTS 100
 #define MAX_NEIGHBORS 100
@@ -51,12 +52,18 @@ void add_request(int id) {
 void add_neighbor(struct sockaddr_in addr, const char *hostname, int bandwidth, int status) {
     for (int i = 0; i < neighbor_count; i++) {
         if (neighbors[i].addr.sin_addr.s_addr == addr.sin_addr.s_addr) {
+            // Update existing neighbor info
+            strncpy(neighbors[i].hostname, hostname, sizeof(neighbors[i].hostname) - 1);
+            neighbors[i].hostname[sizeof(neighbors[i].hostname) - 1] = '\0';
+            neighbors[i].bandwidth = bandwidth;
+            neighbors[i].status = status;
             return;
         }
     }
     if (neighbor_count < MAX_NEIGHBORS) {
         neighbors[neighbor_count].addr = addr;
         strncpy(neighbors[neighbor_count].hostname, hostname, sizeof(neighbors[neighbor_count].hostname) - 1);
+        neighbors[neighbor_count].hostname[sizeof(neighbors[neighbor_count].hostname) - 1] = '\0';
         neighbors[neighbor_count].bandwidth = bandwidth;
         neighbors[neighbor_count].status = status;
         neighbor_count++;
@@ -64,8 +71,14 @@ void add_neighbor(struct sockaddr_in addr, const char *hostname, int bandwidth, 
 }
 
 void send_hello(int sockfd, int bandwidth, int status) {
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        perror("gethostname");
+        strcpy(hostname, "unknown");
+    }
+    
     char hello_msg[1024];
-    snprintf(hello_msg, sizeof(hello_msg), "OSPF_HELLO %d %d", bandwidth, status);
+    snprintf(hello_msg, sizeof(hello_msg), "OSPF_HELLO %s %d %d", hostname, bandwidth, status);
 
     struct sockaddr_in broadcast_addr;
     memset(&broadcast_addr, 0, sizeof(broadcast_addr));
@@ -96,6 +109,12 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    int broadcastEnable = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
+        perror("setsockopt (SO_BROADCAST)");
+        exit(EXIT_FAILURE);
+    }
+
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(NEIGHBOR_PORT);
@@ -108,6 +127,11 @@ int main() {
 
     printf("OSPF Agent listening on UDP port %d...\n", NEIGHBOR_PORT);
 
+    // Send initial hello to discover neighbors
+    int bandwidth = 1000;  // You can get actual bandwidth if needed
+    int status = 1;        // Set appropriate status
+    send_hello(sockfd, bandwidth, status);
+
     while (1) {
         struct sockaddr_in sender_addr;
         addr_len = sizeof(sender_addr);
@@ -119,17 +143,17 @@ int main() {
         buffer[n] = '\0';
 
         if (strncmp(buffer, "OSPF_HELLO", 10) == 0) {
-            char hostname[256];
+            char remote_hostname[256];
             int received_bandwidth, received_status;
-            if (sscanf(buffer, "OSPF_HELLO %d %d", &received_bandwidth, &received_status) != 2) {
+            if (sscanf(buffer, "OSPF_HELLO %255s %d %d", remote_hostname, &received_bandwidth, &received_status) != 3) {
                 continue;
             }
-            if (gethostname(hostname, sizeof(hostname)) != 0) {
-                perror("gethostname");
-                strcpy(hostname, "unknown");
-            }
-            add_neighbor(sender_addr, hostname, received_bandwidth, received_status);
+            
+            add_neighbor(sender_addr, remote_hostname, received_bandwidth, received_status);
             send_lsa(sockfd);
+        } else if (strncmp(buffer, "OSPF_LSA", 8) == 0) {
+            // Process LSA messages
+            // You'll need to implement LSA processing logic here
         }
     }
 

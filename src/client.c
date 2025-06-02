@@ -11,9 +11,9 @@
 #include <linux/sockios.h>
 #include <ifaddrs.h>
 #include "neighborshow.h"
+#include "ospf_common.h"
 
 #define RESPONSE_TIMEOUT 3
-#define MAX_NEIGHBORS 100
 
 typedef struct {
     char hostname[256];
@@ -55,8 +55,14 @@ void get_network_info(int *bandwidth, int *status) {
 }
 
 void send_hello(int sockfd, int bandwidth, int status) {
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        perror("gethostname");
+        strcpy(hostname, "unknown");
+    }
+    
     char hello_msg[1024];
-    snprintf(hello_msg, sizeof(hello_msg), "OSPF_HELLO %d %d", bandwidth, status);
+    snprintf(hello_msg, sizeof(hello_msg), "OSPF_HELLO %s %d %d", hostname, bandwidth, status);
 
     struct sockaddr_in broadcast_addr;
     memset(&broadcast_addr, 0, sizeof(broadcast_addr));
@@ -96,16 +102,18 @@ int collect_neighbor_responses(int sockfd, Neighbor *neighbors) {
         }
         buffer[n] = '\0';
 
-        if (strncmp(buffer, "OSPF_LSA", 8) == 0) {
-            char hostname[256];
-            if (gethostname(hostname, sizeof(hostname)) != 0) {
-                perror("gethostname");
-                strcpy(hostname, "unknown");
+        if (strncmp(buffer, "OSPF_HELLO", 10) == 0) {
+            char remote_hostname[256];
+            int received_bandwidth, received_status;
+            if (sscanf(buffer, "OSPF_HELLO %255s %d %d", remote_hostname, &received_bandwidth, &received_status) != 3) {
+                continue;
             }
+            
             neighbors[neighbor_count].addr = sender_addr;
-            strncpy(neighbors[neighbor_count].hostname, hostname, sizeof(neighbors[neighbor_count].hostname) - 1);
-            neighbors[neighbor_count].bandwidth = 0; // Placeholder, devrait être extrait du message
-            neighbors[neighbor_count].status = 0; // Placeholder, devrait être extrait du message
+            strncpy(neighbors[neighbor_count].hostname, remote_hostname, sizeof(neighbors[neighbor_count].hostname) - 1);
+            neighbors[neighbor_count].hostname[sizeof(neighbors[neighbor_count].hostname) - 1] = '\0';
+            neighbors[neighbor_count].bandwidth = received_bandwidth;
+            neighbors[neighbor_count].status = received_status;
             neighbor_count++;
         }
     }
