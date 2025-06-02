@@ -1,4 +1,4 @@
-TARGET ?= ifshow
+TARGET ?= neighborshow
 
 CC = gcc
 CFLAGS = -static -Wall -Wextra -O2
