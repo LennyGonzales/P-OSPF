@@ -85,20 +85,11 @@ void send_lsa(int sockfd) {
     }
 }
 
-void get_network_info(int *bandwidth, int *status) {
-    // Simuler la récupération du débit et du statut
-    *bandwidth = 1000; // Exemple de débit maximal en Mbps
-    *status = 1; // Exemple de statut (1 pour actif)
-}
-
 int main() {
     int sockfd;
     struct sockaddr_in addr;
     char buffer[1024];
     socklen_t addr_len;
-    int bandwidth, status;
-
-    get_network_info(&bandwidth, &status);
 
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
