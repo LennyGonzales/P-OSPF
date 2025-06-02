@@ -1,7 +1,6 @@
 #ifndef OSPF_COMMON_H
 #define OSPF_COMMON_H
 
-#define NEIGHBOR_PORT 8888
 #define MAX_NEIGHBORS 100
 #define MAX_REQUESTS 100
 #define OSPF_HELLO 1
