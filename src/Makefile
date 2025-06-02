@@ -3,13 +3,13 @@ TARGET ?= ifshow
 CC = gcc
 CFLAGS = -static -Wall -Wextra -O2
 
-SRC = $(TARGET).c
 BIN = $(TARGET)
 
 all: $(BIN)
 
-$(BIN): $(SRC)
-	$(CC) $(CFLAGS) -o ifnetshow ifnetshow.c interfaces.c
+$(BIN):
+	$(CC) $(CFLAGS) -o bin/neighborshow neighborshow.c
+	$(CC) $(CFLAGS) -o bin/neighborshow-agent neighborshow-agent.c
 
 clean:
 	rm -f $(BIN)
