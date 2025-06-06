@@ -1,4 +1,3 @@
-// main.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,6 +8,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <errno.h>
+#include <netdb.h>
 
 #define MULTICAST_ADDR "224.0.0.5"
 #define PORT 5000
@@ -50,25 +50,32 @@ Router topology[MAX_ROUTERS];
 int topology_size = 0;
 
 char *get_local_ip() {
-    static char ip[INET_ADDRSTRLEN];
-    struct ifaddrs *ifaddr, *ifa;
-    void *tmp;
+    char hostname[1024];
+    struct hostent *host_entry;
+    char *IPbuffer;
 
-    if (getifaddrs(&ifaddr) == -1) {
-        perror("getifaddrs");
-        return NULL;
+    // Obtenir le nom de l'hôte
+    if (gethostname(hostname, sizeof(hostname)) == -1) {
+        perror("gethostname");
+        return 1;
     }
 
-    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
-            continue;
-        if (strcmp(ifa->ifa_name, "lo") == 0) continue;
-        tmp = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
-        inet_ntop(AF_INET, tmp, ip, INET_ADDRSTRLEN);
-        break;
+    // Résolution du nom en adresse IP
+    host_entry = gethostbyname(hostname);
+    if (host_entry == NULL) {
+        herror("gethostbyname");
+        return 1;
     }
-    freeifaddrs(ifaddr);
-    return ip;
+
+    // Convertir l'adresse IP au format lisible
+    IPbuffer = inet_ntoa(*((struct in_addr*) host_entry->h_addr_list[0]));
+    if (IPbuffer == NULL) {
+        perror("inet_ntoa");
+        return 1;
+    }
+
+    printf("IP locale : %s\n", IPbuffer);
+    return IPbuffer;
 }
 
 void update_topology(LSAMessage *lsa) {
