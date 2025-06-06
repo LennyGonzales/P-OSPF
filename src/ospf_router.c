@@ -149,7 +149,7 @@ void compute_shortest_paths(const char *source_id) {
     for (int i = 0; i < topology_size; i++) {
         if (strcmp(nodes[i].router_id, source_id) == 0) continue;
         printf("To %s via %s (cost: %d)\n", nodes[i].router_id,
-               nodes[i].prev[0] ? nodes[i].prev : "-", nodes[i].cost);
+               nodes[i].prev[0] ? nodes[i].prev : "Direct Access", nodes[i].cost);
     }
 }
 
@@ -226,7 +226,7 @@ int main() {
             }
         }
 
-        if (time(NULL) - last_hello >= 5) {
+        if (time(NULL) - last_hello >= 20) {
             send_hello(sock, &remote, router_id);
             last_hello = time(NULL);
         }
