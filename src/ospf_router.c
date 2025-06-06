@@ -1,36 +1,56 @@
+// main.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <ifaddrs.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
-#include <net/if.h>
-#include <errno.h>
 #include <time.h>
+#include <errno.h>
 
 #define MULTICAST_ADDR "224.0.0.5"
 #define PORT 5000
-#define MAX_BUF 1024
+#define MAX_ROUTERS 32
+#define MAX_NEIGHBORS 8
 
-// Types de messages
 #define MSG_HELLO 1
-#define MSG_LSA   2
-
-typedef struct {
-    int type;
-    char router_id[32]; // identifiant du routeur (ex: IP)
-} OSPFHello;
+#define MSG_LSA 2
 
 typedef struct {
     int type;
     char router_id[32];
-    char advertised_network[32]; // exemple: "10.0.0.0/24"
-} OSPFLSA;
+} HelloMessage;
+
+typedef struct {
+    int type;
+    char router_id[32];
+    int neighbor_count;
+    struct {
+        char neighbor_id[32];
+        int link_up;
+        int capacity; // en Mbps
+    } neighbors[MAX_NEIGHBORS];
+} LSAMessage;
+
+typedef struct {
+    char router_id[32];
+    int link_up;
+    int capacity;
+} Neighbor;
+
+typedef struct {
+    char router_id[32];
+    Neighbor neighbors[MAX_NEIGHBORS];
+    int neighbor_count;
+} Router;
+
+Router topology[MAX_ROUTERS];
+int topology_size = 0;
 
 char *get_local_ip() {
-    static char ip[INET_ADDRSTRLEN] = "";
+    static char ip[INET_ADDRSTRLEN];
     struct ifaddrs *ifaddr, *ifa;
     void *tmp;
 
@@ -39,114 +59,167 @@ char *get_local_ip() {
         return NULL;
     }
 
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
             continue;
-        if (strcmp(ifa->ifa_name, "lo") == 0)
-            continue;
+        if (strcmp(ifa->ifa_name, "lo") == 0) continue;
         tmp = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
         inet_ntop(AF_INET, tmp, ip, INET_ADDRSTRLEN);
         break;
     }
-
     freeifaddrs(ifaddr);
     return ip;
 }
 
+void update_topology(LSAMessage *lsa) {
+    for (int i = 0; i < topology_size; i++) {
+        if (strcmp(topology[i].router_id, lsa->router_id) == 0) {
+            topology[i].neighbor_count = lsa->neighbor_count;
+            for (int j = 0; j < lsa->neighbor_count; j++) {
+                topology[i].neighbors[j].link_up = lsa->neighbors[j].link_up;
+                topology[i].neighbors[j].capacity = lsa->neighbors[j].capacity;
+                strncpy(topology[i].neighbors[j].router_id, lsa->neighbors[j].neighbor_id, 32);
+            }
+            return;
+        }
+    }
+    // Nouveau routeur
+    strncpy(topology[topology_size].router_id, lsa->router_id, 32);
+    topology[topology_size].neighbor_count = lsa->neighbor_count;
+    for (int j = 0; j < lsa->neighbor_count; j++) {
+        strncpy(topology[topology_size].neighbors[j].router_id, lsa->neighbors[j].neighbor_id, 32);
+        topology[topology_size].neighbors[j].link_up = lsa->neighbors[j].link_up;
+        topology[topology_size].neighbors[j].capacity = lsa->neighbors[j].capacity;
+    }
+    topology_size++;
+}
+
+void compute_shortest_paths(const char *source_id) {
+    typedef struct {
+        char router_id[32];
+        int cost;
+        char prev[32];
+        int visited;
+    } Node;
+
+    Node nodes[MAX_ROUTERS];
+    for (int i = 0; i < topology_size; i++) {
+        strncpy(nodes[i].router_id, topology[i].router_id, 32);
+        nodes[i].cost = strcmp(topology[i].router_id, source_id) == 0 ? 0 : 1e9;
+        nodes[i].prev[0] = '\0';
+        nodes[i].visited = 0;
+    }
+
+    while (1) {
+        int min_idx = -1;
+        int min_cost = 1e9;
+        for (int i = 0; i < topology_size; i++) {
+            if (!nodes[i].visited && nodes[i].cost < min_cost) {
+                min_cost = nodes[i].cost;
+                min_idx = i;
+            }
+        }
+        if (min_idx == -1) break;
+
+        nodes[min_idx].visited = 1;
+        Router *router = &topology[min_idx];
+        for (int j = 0; j < router->neighbor_count; j++) {
+            if (!router->neighbors[j].link_up) continue;
+            // coût inverse à la capacité : + de débit = moins cher
+            int weight = 1000 / router->neighbors[j].capacity;
+            for (int k = 0; k < topology_size; k++) {
+                if (strcmp(topology[k].router_id, router->neighbors[j].router_id) == 0) {
+                    if (nodes[min_idx].cost + weight < nodes[k].cost) {
+                        nodes[k].cost = nodes[min_idx].cost + weight;
+                        strncpy(nodes[k].prev, router->router_id, 32);
+                    }
+                }
+            }
+        }
+    }
+
+    printf("\n=== Routing Table (%s) ===\n", source_id);
+    for (int i = 0; i < topology_size; i++) {
+        if (strcmp(nodes[i].router_id, source_id) == 0) continue;
+        printf("To %s via %s (cost: %d)\n", nodes[i].router_id,
+               nodes[i].prev[0] ? nodes[i].prev : "-", nodes[i].cost);
+    }
+}
+
 void send_hello(int sock, struct sockaddr_in *addr, const char *router_id) {
-    OSPFHello hello = {MSG_HELLO, ""};
-    strncpy(hello.router_id, router_id, sizeof(hello.router_id));
-    sendto(sock, &hello, sizeof(hello), 0, (struct sockaddr *)addr, sizeof(*addr));
-    printf("[SENT] Hello from %s\n", router_id);
+    HelloMessage msg = {MSG_HELLO, ""};
+    strncpy(msg.router_id, router_id, sizeof(msg.router_id));
+    sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)addr, sizeof(*addr));
 }
 
 void send_lsa(int sock, struct sockaddr_in *addr, const char *router_id) {
-    OSPFLSA lsa = {MSG_LSA, "", ""};
-    strncpy(lsa.router_id, router_id, sizeof(lsa.router_id));
-    strncpy(lsa.advertised_network, "10.0.0.0/24", sizeof(lsa.advertised_network));
-    sendto(sock, &lsa, sizeof(lsa), 0, (struct sockaddr *)addr, sizeof(*addr));
-    printf("[SENT] LSA from %s\n", router_id);
+    LSAMessage msg = {MSG_LSA, "", 1};
+    strncpy(msg.router_id, router_id, sizeof(msg.router_id));
+    strncpy(msg.neighbors[0].neighbor_id, "192.168.1.1", 32); // Simulé
+    msg.neighbors[0].link_up = 1;
+    msg.neighbors[0].capacity = 100; // Mbps
+    sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)addr, sizeof(*addr));
 }
 
 int main() {
-    int sock;
-    struct sockaddr_in local_addr, multicast_addr;
-    struct ip_mreq mreq;
-    char buf[MAX_BUF];
-    ssize_t len;
-    socklen_t addrlen;
-    char *local_ip = get_local_ip();
-
-    if (!local_ip) {
-        fprintf(stderr, "Could not determine local IP.\n");
-        exit(EXIT_FAILURE);
+    char *router_id = get_local_ip();
+    if (!router_id) {
+        fprintf(stderr, "IP locale introuvable\n");
+        exit(1);
     }
 
-    printf("Starting OSPF router with ID: %s\n", local_ip);
+    printf("Router ID: %s\n", router_id);
 
-    // Create socket
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    // Allow multiple sockets to use the same PORT
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
     int yes = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    // Bind to port
-    memset(&local_addr, 0, sizeof(local_addr));
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(PORT);
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        perror("bind");
-        exit(EXIT_FAILURE);
-    }
+    struct sockaddr_in local = {0}, remote = {0};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(PORT);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(sock, (struct sockaddr *)&local, sizeof(local));
 
-    // Join multicast group
+    struct ip_mreq mreq;
     mreq.imr_multiaddr.s_addr = inet_addr(MULTICAST_ADDR);
-    mreq.imr_interface.s_addr = inet_addr(local_ip);
-    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        perror("setsockopt - multicast");
-        exit(EXIT_FAILURE);
-    }
+    mreq.imr_interface.s_addr = inet_addr(router_id);
+    setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
-    // Setup destination addr
-    memset(&multicast_addr, 0, sizeof(multicast_addr));
-    multicast_addr.sin_family = AF_INET;
-    multicast_addr.sin_port = htons(PORT);
-    multicast_addr.sin_addr.s_addr = inet_addr(MULTICAST_ADDR);
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(PORT);
+    remote.sin_addr.s_addr = inet_addr(MULTICAST_ADDR);
 
-    // Main loop
-    time_t last_hello = 0;
+    time_t last_hello = 0, last_lsa = 0;
+    char buf[2048];
+    socklen_t len;
+
     while (1) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(sock, &fds);
+        struct timeval tv = {1, 0};
+        select(sock + 1, &fds, NULL, NULL, &tv);
 
-        struct timeval timeout = {1, 0}; // check every second
-        if (select(sock + 1, &fds, NULL, NULL, &timeout) > 0) {
-            addrlen = sizeof(multicast_addr);
-            len = recvfrom(sock, buf, MAX_BUF, 0, (struct sockaddr *)&multicast_addr, &addrlen);
-            if (len > 0) {
+        if (FD_ISSET(sock, &fds)) {
+            len = sizeof(remote);
+            ssize_t r = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&remote, &len);
+            if (r > 0) {
                 int type = *(int *)buf;
                 if (type == MSG_HELLO) {
-                    OSPFHello *hello = (OSPFHello *)buf;
-                    printf("[RECV] Hello from %s\n", hello->router_id);
-                    // répondre avec LSA
-                    send_lsa(sock, &multicast_addr, local_ip);
+                    HelloMessage *h = (HelloMessage *)buf;
+                    printf("[RECV] HELLO from %s\n", h->router_id);
+                    send_lsa(sock, &remote, router_id);
                 } else if (type == MSG_LSA) {
-                    OSPFLSA *lsa = (OSPFLSA *)buf;
-                    printf("[RECV] LSA from %s: network %s\n", lsa->router_id, lsa->advertised_network);
+                    LSAMessage *lsa = (LSAMessage *)buf;
+                    printf("[RECV] LSA from %s\n", lsa->router_id);
+                    update_topology(lsa);
+                    compute_shortest_paths(router_id);
                 }
             }
         }
 
-        // Envoie périodique de Hello
         if (time(NULL) - last_hello >= 5) {
-            send_hello(sock, &multicast_addr, local_ip);
+            send_hello(sock, &remote, router_id);
             last_hello = time(NULL);
         }
     }
