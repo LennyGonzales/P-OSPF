@@ -57,21 +57,21 @@ char *get_local_ip() {
     // Obtenir le nom de l'hôte
     if (gethostname(hostname, sizeof(hostname)) == -1) {
         perror("gethostname");
-        return 1;
+        return NULL;
     }
 
     // Résolution du nom en adresse IP
     host_entry = gethostbyname(hostname);
     if (host_entry == NULL) {
         herror("gethostbyname");
-        return 1;
+        return NULL;
     }
 
     // Convertir l'adresse IP au format lisible
     IPbuffer = inet_ntoa(*((struct in_addr*) host_entry->h_addr_list[0]));
     if (IPbuffer == NULL) {
         perror("inet_ntoa");
-        return 1;
+        return NULL;
     }
 
     printf("IP locale : %s\n", IPbuffer);
@@ -157,6 +157,7 @@ void send_hello(int sock, struct sockaddr_in *addr, const char *router_id) {
     HelloMessage msg = {MSG_HELLO, ""};
     strncpy(msg.router_id, router_id, sizeof(msg.router_id));
     sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)addr, sizeof(*addr));
+    printf("[SEND] HELLO from %s to %s\n", msg.router_id, inet_ntoa(addr->sin_addr));
 }
 
 void send_lsa(int sock, struct sockaddr_in *addr, const char *router_id) {
