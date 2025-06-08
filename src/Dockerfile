@@ -1,24 +1,24 @@
-# Utilise une image de base avec gcc et make
+# Utilise une image de base avec gcc
 FROM gcc:latest
 
-# Dépendances nécessaires (ex : libpcap-dev si nécessaire)
+# Installer les dépendances
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpcap-dev \
+    tcpdump \
     && rm -rf /var/lib/apt/lists/*
 
-# Copie le code dans le conteneur
+# Copier le code dans le conteneur
 COPY . /app
 
 # Définir le répertoire de travail
 WORKDIR /app
 
-# Compiler ton programme
+# Compiler le programme (remplace par `make` si tu as un Makefile)
 RUN gcc -o ospf_router ospf_router.c
 
-# Expose le port UDP pour la communication (par exemple, port 5000)
-EXPOSE 5000/udp
+# Expose un port si nécessaire (facultatif pour OSPF qui utilise IP direct)
+# EXPOSE 5000/udp
 
-# Commande pour démarrer le programme
-# CMD ["./ospf_router"]
-CMD ["sleep", "infinity"]
+# Lancer ton programme (ou sleep si tu veux garder le conteneur ouvert)
+CMD ["./ospf_router"]
