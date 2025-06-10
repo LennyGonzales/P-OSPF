@@ -25,10 +25,21 @@ jobs:
         run: cargo build --release
         working-directory: routing_project
 
-      - name: Upload binary and .deb to GitHub release
+      - name: Create GitHub Release
+        id: create_release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            routing_project/target/release/routing_project
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload routing_project binary
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: routing_project/target/release/routing_project
+          asset_name: routing_project
+          asset_content_type: application/octet-stream
