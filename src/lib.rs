@@ -5,5 +5,6 @@ pub mod server;
 pub mod core;
 pub mod protocol;
 pub mod utils;
-
 pub mod error;
+
+pub use error::ProtocolError;

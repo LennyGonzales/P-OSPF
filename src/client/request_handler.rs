@@ -2,6 +2,29 @@ mod request_handler {
     use crate::protocol::message_types::{Request, Response};
     use crate::server::response_handler::handle_response;
     use std::net::UdpSocket;
+    use tokio::net::UdpSocket as TokioUdpSocket;
+    use std::sync::Arc;
+    use crate::error::ProtocolError;
+
+    pub struct RequestHandler {
+        socket: Arc<TokioUdpSocket>,
+    }
+
+    impl RequestHandler {
+        pub fn new(socket: Arc<TokioUdpSocket>) -> Self {
+            Self { socket }
+        }
+        
+        pub async fn handle_response(&self) -> Result<ProtocolMessage, ProtocolError> {
+            let mut buf = [0; 1024];
+            let (len, _) = self.socket.recv_from(&mut buf).await?;
+            
+            let msg_str = String::from_utf8_lossy(&buf[..len]);
+            let message: ProtocolMessage = serde_json::from_str(&msg_str)?;
+            
+            Ok(message)
+        }
+    }
 
     pub fn handle_request(socket: &UdpSocket, buf: &[u8]) {
         match bincode::deserialize::<Request>(buf) {

@@ -2,3 +2,6 @@
 
 pub mod protocol_client;
 pub mod request_handler;
+
+pub use protocol_client::ProtocolClient;
+pub use request_handler::RequestHandler;

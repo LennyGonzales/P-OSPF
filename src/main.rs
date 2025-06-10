@@ -9,25 +9,33 @@ mod protocol;
 mod utils;
 mod error;
 
-fn main() {
-    // Initialize the routing protocol
-    println!("Starting the Rust Routing Protocol...");
+use log::{info, error};
+use std::env;
+use rust_routing_protocol::server::protocol_server::ProtocolServer;
+use rust_routing_protocol::utils::{init_logger, Config};
+use rust_routing_protocol::error::ProtocolError;
 
-    // Set up client and server components
-    let client = client::protocol_client::initialize_client();
-    let server = server::protocol_server::initialize_server();
-
-    // Main execution loop
-    loop {
-        // Handle client requests and server responses
-        client.handle_requests();
-        server.handle_responses();
-
-        // Add logic for updating routing tables and neighbor discovery
-        core::neighbor_discovery::discover_neighbors();
-        core::path_calculation::update_best_paths();
-
-        // Sleep or wait for a specific event to avoid busy waiting
-        std::thread::sleep(std::time::Duration::from_secs(1));
+#[tokio::main]
+async fn main() -> Result<(), ProtocolError> {
+    init_logger();
+    
+    let config = Config::load_from_file("config.json")
+        .unwrap_or_else(|_| {
+            info!("Using default configuration");
+            Config::default()
+        });
+    
+    info!("Starting Rust Routing Protocol");
+    info!("Router ID: {}", config.router_id);
+    info!("Bind address: {}", config.bind_address);
+    info!("Broadcast address: {}", config.broadcast_address);
+    
+    let server = ProtocolServer::new(&config.bind_address, &config.broadcast_address).await?;
+    
+    if let Err(e) = server.start().await {
+        error!("Server error: {}", e);
+        return Err(e);
     }
+    
+    Ok(())
 }

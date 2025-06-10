@@ -1,6 +1,7 @@
 // This file defines custom error types and handling mechanisms for the application.
 
 use std::fmt;
+use thiserror::Error;
 
 #[derive(Debug)]
 pub enum RoutingError {
@@ -24,3 +25,27 @@ impl fmt::Display for RoutingError {
 }
 
 impl std::error::Error for RoutingError {}
+
+#[derive(Error, Debug)]
+pub enum ProtocolError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    
+    #[error("Address parse error: {0}")]
+    AddrParse(#[from] std::net::AddrParseError),
+    
+    #[error("Network interface error: {0}")]
+    NetworkInterface(String),
+    
+    #[error("Routing table error: {0}")]
+    RoutingTable(String),
+    
+    #[error("Neighbor discovery error: {0}")]
+    NeighborDiscovery(String),
+    
+    #[error("Protocol error: {0}")]
+    Protocol(String),
+}

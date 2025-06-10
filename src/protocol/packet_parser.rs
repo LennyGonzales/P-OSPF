@@ -38,3 +38,41 @@ mod packet_parser {
         data
     }
 }
+
+use serde_json;
+use crate::protocol::message_types::ProtocolMessage;
+use crate::error::ProtocolError;
+
+pub struct PacketParser;
+
+impl PacketParser {
+    pub fn parse_message(data: &[u8]) -> Result<ProtocolMessage, ProtocolError> {
+        let json_str = std::str::from_utf8(data)
+            .map_err(|_| ProtocolError::Protocol("Invalid UTF-8 in packet".to_string()))?;
+            
+        let message: ProtocolMessage = serde_json::from_str(json_str)?;
+        Ok(message)
+    }
+    
+    pub fn serialize_message(message: &ProtocolMessage) -> Result<Vec<u8>, ProtocolError> {
+        let json_str = serde_json::to_string(message)?;
+        Ok(json_str.into_bytes())
+    }
+    
+    pub fn validate_message(message: &ProtocolMessage) -> bool {
+        match message {
+            ProtocolMessage::Hello(hello) => {
+                !hello.router_id.is_empty() && hello.timestamp > 0
+            }
+            ProtocolMessage::LinkState(link_state) => {
+                !link_state.router_id.is_empty() && link_state.timestamp > 0
+            }
+            ProtocolMessage::RouteRequest(request) => {
+                !request.destination.is_empty() && !request.source.is_empty()
+            }
+            ProtocolMessage::RouteResponse(response) => {
+                !response.destination.is_empty() && !response.next_hop.is_empty()
+            }
+        }
+    }
+}

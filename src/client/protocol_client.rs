@@ -1,42 +1,44 @@
 // This file implements the client-side logic for emitting requests to the server,
 // including functions to initiate communication and handle responses.
 
-use std::net::{UdpSocket, SocketAddr};
-use std::time::Duration;
-use serde::{Serialize, Deserialize};
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Request {
-    pub request_type: String,
-    pub payload: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Response {
-    pub status: String,
-    pub data: String,
-}
+use tokio::net::UdpSocket;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use crate::protocol::message_types::*;
+use crate::error::ProtocolError;
+use log::{info, error};
 
 pub struct ProtocolClient {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
 }
 
 impl ProtocolClient {
-    pub fn new(server_ip: &str, server_port: u16) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.set_read_timeout(Some(Duration::new(5, 0)))?;
-        let server_addr = SocketAddr::new(server_ip.parse().unwrap(), server_port);
-        Ok(ProtocolClient { socket, server_addr })
+    pub async fn new(server_addr: &str) -> Result<Self, ProtocolError> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let server_addr: SocketAddr = server_addr.parse()?;
+        
+        Ok(Self {
+            socket: Arc::new(socket),
+            server_addr,
+        })
     }
-
-    pub fn send_request(&self, request: Request) -> std::io::Result<Response> {
-        let serialized_request = serde_json::to_string(&request).unwrap();
-        self.socket.send_to(serialized_request.as_bytes(), &self.server_addr)?;
-
-        let mut buf = [0; 1024];
-        let (size, _) = self.socket.recv_from(&mut buf)?;
-        let response: Response = serde_json::from_slice(&buf[..size]).unwrap();
-        Ok(response)
+    
+    pub async fn send_route_request(&self, destination: String) -> Result<(), ProtocolError> {
+        let request = ProtocolMessage::RouteRequest(RouteRequest {
+            destination,
+            source: "client".to_string(),
+            request_id: 1,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        });
+        
+        let msg_str = serde_json::to_string(&request)?;
+        self.socket.send_to(msg_str.as_bytes(), self.server_addr).await?;
+        
+        info!("Sent route request for destination: {}", request.destination);
+        Ok(())
     }
 }
