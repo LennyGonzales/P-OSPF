@@ -43,3 +43,5 @@ jobs:
           asset_path: routing_project/target/release/routing_project
           asset_name: routing_project
           asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
