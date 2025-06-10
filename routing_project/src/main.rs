@@ -172,10 +172,11 @@ async fn update_topology(state: Arc<AppState>, lsa: LSAMessage) -> Result<(), Bo
 
 async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let topology = state.topology.lock().await;
-    let mut nodes: HashMap<String, (u32, Option<String>)> = topology
+    let mut nodes: HashMap<String, (f64, Option<String>)> = topology
         .keys()
-        .map(|id| (id.clone(), (if id == source_id { 0 } else { u32::MAX }, None)))
+        .map(|id| (id.clone(), (if id == source_id { 0.0 } else { f64::INFINITY }, None)))
         .collect();
+
 
     let mut visited = Vec::new();
     while visited.len() < topology.len() {
@@ -193,8 +194,9 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
                         continue;
                     }
 
-                    let weight = 1000 / neighbor.capacity;
+                    let weight = 1000.0 / neighbor.capacity as f64;
                     let new_cost = nodes[&current].0 + weight;
+
 
                     if !nodes.contains_key(&neighbor.neighbor_id) { // Ajoute s'il n'existe pas
                         nodes.insert(neighbor.neighbor_id.clone(), (new_cost, Some(current.clone())));
@@ -212,7 +214,7 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
     for (id, (cost, prev)) in nodes {
         if id != source_id {
             let gateway = prev.unwrap_or_else(|| "0.0.0.0".to_string());
-            println!("To {} via {} (cost: {})", id, gateway, cost);
+            println!("To {} via {} (cost: {:.2})", id, gateway, cost);
             if let Err(e) = update_routing_table(&id, &gateway).await {
                 log::error!("Failed to update routing table: {}", e);
             }
