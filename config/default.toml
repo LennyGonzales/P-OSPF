@@ -1,0 +1,32 @@
+# Configuration file for the Rust Routing Protocol
+
+# Default settings for the routing protocol
+[protocol]
+# Time interval for sending Hello packets (in seconds)
+hello_interval = 5
+
+# Timeout for neighbor responses (in seconds)
+neighbor_timeout = 15
+
+# Maximum number of hops allowed in the routing table
+max_hops = 15
+
+# Logging level: options are "error", "warn", "info", "debug", "trace"
+log_level = "info"
+
+[interfaces]
+# List of network interfaces to include in routing calculations
+# Example: ["eth0", "eth1"]
+included_interfaces = []
+
+[link_states]
+# Default link state settings
+# Example: {"eth0": {"capacity": 1000, "status": "active"}}
+link_states = {}
+
+[security]
+# Enable or disable security features
+enable_security = true
+
+# Security key for encrypted communication
+security_key = "your_secure_key_here"
