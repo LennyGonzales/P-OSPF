@@ -1,2 +1,0 @@
-impl Future<Output = Result<Vec<Route>, std::io::error::Error>>
-impl Future<Output = Result<Vec<Route>, std::io::Error>>

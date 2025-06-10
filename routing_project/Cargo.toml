@@ -2,6 +2,12 @@
 name = "ospf-router"
 version = "0.1.0"
 edition = "2021"
+authors = ["GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>"]
+license = "MIT"
+description = "A simple OSPF router implemented in Rust"
+homepage = "https://github.com/LennyGonzales/P-OSPF"
+repository = "https://github.com/LennyGonzales/P-OSPF"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
