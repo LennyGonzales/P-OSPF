@@ -28,15 +28,10 @@ jobs:
         run: cargo build --release
         working-directory: routing_project
 
-      - name: Build .deb package
-        run: cargo deb
-        working-directory: routing_project
-
       - name: Upload binary and .deb to GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             routing_project/target/release/routing_project
-            routing_project/target/debian/*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
