@@ -36,7 +36,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            routing_project/target/release/custom-ospf
+            routing_project/target/release/routing_project
             routing_project/target/debian/*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
