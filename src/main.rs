@@ -1,19 +1,19 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use net_route::{Route, Handle};
 use pnet::datalink::{self, NetworkInterface};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct HelloMessage {
     message_type: u8,
     hostname: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Neighbor {
     neighbor_id: String,
     link_up: bool,
@@ -35,6 +35,7 @@ struct Router {
 
 struct AppState {
     topology: Mutex<HashMap<String, Router>>,
+    neighbors: Mutex<HashMap<String, Neighbor>>,
 }
 
 #[tokio::main]
@@ -51,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         topology: Mutex::new(HashMap::new()),
+        neighbors: Mutex::new(HashMap::new()),
     });
 
     let socket_clone = Arc::clone(&socket);
@@ -68,7 +70,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-
     let mut buf = [0; 2048];
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
@@ -82,7 +83,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("IN [RECV] HELLO");
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
                                 println!("[RECV] HELLO from {} - {}", hello.hostname, src_addr);
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &hostname).await {
+                                
+                                let mut neighbors = state.neighbors.lock().await;
+                                neighbors.insert(
+                                    hello.hostname.clone(),
+                                    Neighbor {
+                                        neighbor_id: hello.hostname.clone(),
+                                        link_up: true,
+                                        capacity: 100, // À ajuster si besoin
+                                    },
+                                );
+                                drop(neighbors); // Libère le verrou avant l'envoi
+
+                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &hostname, state.clone()).await {
                                     log::error!("Failed to send LSA: {}", e);
                                 }
                             }
@@ -90,10 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
                                 println!("[RECV] LSA from {} - {}", lsa.hostname, src_addr);
-                                if let Err(e) = update_topology(state.clone(), lsa).await {
+                                if let Err(e) = update_topology(state.clone(), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                if let Err(e) = compute_shortest_paths(state.clone(), &hostname).await {
+                                if let Err(e) = compute_shortest_paths(state.clone(), &lsa.hostname).await {
                                     log::error!("Failed to compute shortest paths: {}", e);
                                 }
                             }
@@ -111,6 +124,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+
+fn resolve_hostname(hostname: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    let addrs = (hostname, 0).to_socket_addrs()?;
+    if let Some(socket_addr) = addrs.filter(|addr| addr.is_ipv4()).next() {
+        if let IpAddr::V4(ipv4_addr) = socket_addr.ip() {
+            return Ok(ipv4_addr);
+        }
+    }
+    Err("Failed to resolve IP address".into())
+}
+
+
 async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, hostname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let message = HelloMessage {
         message_type: 1,
@@ -122,17 +147,17 @@ async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, hostname: &str) -> Re
     Ok(())
 }
 
-async fn send_lsa(socket: &UdpSocket, addr: &SocketAddr, hostname: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_lsa(socket: &UdpSocket, addr: &SocketAddr, hostname: &str, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let neighbors = state.neighbors.lock().await;
+    let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
+
     let message = LSAMessage {
         message_type: 2,
         hostname: hostname.to_string(),
-        neighbor_count: 1,
-        neighbors: vec![Neighbor {
-            neighbor_id: "192.168.1.1".to_string(),
-            link_up: true,
-            capacity: 100,
-        }],
+        neighbor_count: neighbors_vec.len(),
+        neighbors: neighbors_vec,
     };
+
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
     println!("[SEND] LSA from {}", hostname);
@@ -166,18 +191,18 @@ fn get_hostname() -> Result<String, Box<dyn std::error::Error>> {
     Ok(hostname_str)
 }
 
-
-async fn update_topology(state: Arc<AppState>, lsa: LSAMessage) -> Result<(), Box<dyn std::error::Error>> {
+async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), Box<dyn std::error::Error>> {
     let mut topology = state.topology.lock().await;
     topology.insert(
         lsa.hostname.clone(),
         Router {
-            hostname: lsa.hostname,
-            neighbors: lsa.neighbors,
+            hostname: lsa.hostname.clone(),
+            neighbors: lsa.neighbors.clone(),
         },
     );
     Ok(())
 }
+
 
 async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let topology = state.topology.lock().await;
@@ -232,12 +257,14 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
 }
 
 async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Résolution de l'adresse IP pour le destination et le gateway
+    let destination_ip = resolve_hostname(destination)?;
+    let gateway_ip = resolve_hostname(gateway)?;
+
     let handle = Handle::new()?;
-
-    let dest_ip: Ipv4Addr = destination.parse()?;
-    let gateway_ip: Ipv4Addr = gateway.parse()?;
-
-    let route = Route::new(IpAddr::V4(dest_ip), 32)
+    
+    // Création de la route avec les adresses IP
+    let route = Route::new(IpAddr::V4(destination_ip), 32)
         .with_gateway(IpAddr::V4(gateway_ip));
 
     match handle.add(&route).await {
