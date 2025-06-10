@@ -193,19 +193,15 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
                         continue;
                     }
 
-                    // Ajouter le voisin s'il n'existe pas encore dans nodes
-                    if !nodes.contains_key(&neighbor.neighbor_id) {
-                        nodes.insert(neighbor.neighbor_id.clone(), (u32::MAX, None));
-                    }
-
                     let weight = 1000 / neighbor.capacity;
                     let new_cost = nodes[&current].0 + weight;
 
-                    if new_cost < nodes[&neighbor.neighbor_id].0 {
+                    if !nodes.contains_key(&neighbor.neighbor_id) { // Ajoute s'il n'existe pas
+                        nodes.insert(neighbor.neighbor_id.clone(), (new_cost, Some(current.clone())));
+                    } else if new_cost < nodes[&neighbor.neighbor_id].0 { // Mettre à jour le coût si le nouveau est plus bas
                         nodes.insert(neighbor.neighbor_id.clone(), (new_cost, Some(current.clone())));
                     }
                 }
-
             }
         } else {
             break;
