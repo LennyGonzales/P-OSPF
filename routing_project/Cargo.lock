@@ -473,18 +473,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ospf-router"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "log",
- "net-route",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -590,6 +578,18 @@ name = "regex-syntax"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
+
+[[package]]
+name = "routing_project"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "net-route",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "rtnetlink"

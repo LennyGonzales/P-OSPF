@@ -1,5 +1,5 @@
 [package]
-name = "ospf-router"
+name = "routing_project"
 version = "0.1.0"
 edition = "2021"
 authors = ["GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>"]
