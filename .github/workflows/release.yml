@@ -21,9 +21,6 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
-
       - name: Build binary
         run: cargo build --release
         working-directory: routing_project
