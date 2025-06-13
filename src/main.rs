@@ -38,6 +38,25 @@ struct AppState {
     neighbors: Mutex<HashMap<String, Neighbor>>,
 }
 
+fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
+    let interfaces = datalink::interfaces();
+    interfaces
+        .into_iter()
+        .flat_map(|iface: NetworkInterface| {
+            iface.ips.into_iter().filter_map(move |ip_network| {
+                if let IpAddr::V4(ip) = ip_network.ip() {
+                    let prefix_len = ip_network.prefix();
+                    let mask = u32::MAX << (32 - prefix_len);
+                    let broadcast = u32::from(ip) | !mask;
+                    Some((ip.to_string(), SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port)))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -56,14 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let socket_clone = Arc::clone(&socket);
-    let router_ip_clone = router_ip.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
-            let broadcast_addrs = get_broadcast_addresses(5000);
+            let broadcast_addrs = get_broadcast_addresses_with_local(5000);
 
-            for addr in &broadcast_addrs {
-                if let Err(e) = send_hello(&socket_clone, addr, &router_ip_clone).await {
+            for (local_ip, addr) in &broadcast_addrs {
+                if let Err(e) = send_hello(&socket_clone, addr, local_ip).await {
                     log::error!("Failed to send hello to {}: {}", addr, e);
                 }
             }
