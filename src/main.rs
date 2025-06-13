@@ -124,7 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Err(e) = update_topology(state.clone(), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                if let Err(e) = compute_shortest_paths(state.clone(), &lsa.router_ip).await {
+                                // Correction : toujours calculer la table de routage depuis l'IP locale
+                                if let Err(e) = compute_shortest_paths(state.clone(), &router_ip).await {
                                     log::error!("Failed to compute shortest paths: {}", e);
                                 }
                             }
