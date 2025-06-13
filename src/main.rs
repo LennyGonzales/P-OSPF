@@ -262,6 +262,80 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), B
     Ok(())
 }
 
+async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Éviter d'ajouter des routes vers des gateways invalides
+    if gateway == "0.0.0.0" || gateway.is_empty() {
+        log::debug!("Skipping route to {} - invalid gateway: {}", destination, gateway);
+        return Ok(());
+    }
+
+    let destination_ip: Ipv4Addr = destination.parse()?;
+    let gateway_ip: Ipv4Addr = gateway.parse()?;
+
+    // Vérifier si le gateway est dans un réseau accessible
+    if !is_gateway_reachable(&gateway_ip).await {
+        log::warn!("Gateway {} is not reachable, skipping route to {}", gateway, destination);
+        return Ok(());
+    }
+
+    let handle = Handle::new()?;
+    
+    // Calculer l'adresse réseau en appliquant un masque /24 (255.255.255.0)
+    let network_addr = Ipv4Addr::from(u32::from(destination_ip) & 0xFFFFFF00);
+    
+    let route = Route::new(IpAddr::V4(network_addr), 24)
+        .with_gateway(IpAddr::V4(gateway_ip));
+
+    match handle.add(&route).await {
+        Ok(_) => println!("Successfully added route to network {}/24 via {}", network_addr, gateway),
+        Err(e) => {
+            if e.to_string().contains("network unreachable") || e.to_string().contains("101") {
+                log::warn!("Cannot add route to {}/24 via {} - gateway unreachable", network_addr, gateway);
+                return Ok(()); // Ne pas considérer comme une erreur fatale
+            } else if e.to_string().contains("file exists") || e.to_string().contains("17") {
+                log::debug!("Route to {}/24 via {} already exists", network_addr, gateway);
+                return Ok(());
+            } else {
+                log::warn!("Failed to add route to network {}/24 via {}: {}", network_addr, gateway, e);
+                // Essayer de supprimer et re-ajouter
+                let _ = handle.delete(&route).await;
+                match handle.add(&route).await {
+                    Ok(_) => println!("Successfully updated route to network {}/24 via {}", network_addr, gateway),
+                    Err(e2) => {
+                        log::error!("Failed to update route after deletion: {}", e2);
+                        return Err(e2.into());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn is_gateway_reachable(gateway_ip: &Ipv4Addr) -> bool {
+    let local_ips = get_local_ips();
+    let broadcast_addrs = get_broadcast_addresses_with_interface_ips(5000);
+    
+    // Vérifier si le gateway est dans le même réseau qu'une de nos interfaces
+    for (_, interface_ip) in broadcast_addrs {
+        if let Ok(local_ip) = interface_ip.parse::<Ipv4Addr>() {
+            // Vérifier avec différents masques de réseau communs
+            for prefix in [24, 16, 8] {
+                let mask = u32::MAX << (32 - prefix);
+                let local_network = u32::from(local_ip) & mask;
+                let gateway_network = u32::from(*gateway_ip) & mask;
+                
+                if local_network == gateway_network {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
 async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let topology = state.topology.lock().await;
     let mut nodes: HashMap<String, (u32, Option<String>)> = topology
@@ -303,38 +377,22 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result
     println!("\n=== Routing Table ({}) ===", source_ip);
     for (ip, (cost, prev)) in nodes {
         if ip != source_ip {
-            let gateway = prev.unwrap_or_else(|| "0.0.0.0".to_string());
-            println!("To {} via {} (cost: {})", ip, gateway, cost);
-            if let Err(e) = update_routing_table(&ip, &gateway).await {
-                log::error!("Failed to update routing table: {}", e);
+            if let Some(gateway) = prev {
+                // Seulement ajouter des routes vers des gateways directs (voisins)
+                let neighbors = state.neighbors.lock().await;
+                if neighbors.contains_key(&gateway) {
+                    println!("To {} via {} (cost: {})", ip, gateway, cost);
+                    if let Err(e) = update_routing_table(&ip, &gateway).await {
+                        log::error!("Failed to update routing table for {}: {}", ip, e);
+                    }
+                } else {
+                    println!("To {} - no direct route available (cost: {})", ip, cost);
+                }
+            } else {
+                println!("To {} - unreachable (cost: {})", ip, cost);
             }
         }
     }
     println!("\n==========================");
-    Ok(())
-}
-
-async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let destination_ip: Ipv4Addr = destination.parse()?;
-    let gateway_ip: Ipv4Addr = gateway.parse()?;
-
-    let handle = Handle::new()?;
-    
-    // Calculer l'adresse réseau en appliquant un masque /24 (255.255.255.0)
-    let network_addr = Ipv4Addr::from(u32::from(destination_ip) & 0xFFFFFF00);
-    
-    let route = Route::new(IpAddr::V4(network_addr), 24)
-        .with_gateway(IpAddr::V4(gateway_ip));
-
-    match handle.add(&route).await {
-        Ok(_) => println!("Successfully added route to network {}/24 via {}", network_addr, gateway),
-        Err(e) => {
-            log::warn!("Failed to add route to network {}/24 via {}: {}", network_addr, gateway, e);
-            let _ = handle.delete(&route).await;
-            handle.add(&route).await?;
-            println!("Successfully updated route to network {}/24 via {}", network_addr, gateway);
-        }
-    }
-
     Ok(())
 }
