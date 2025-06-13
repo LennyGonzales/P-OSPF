@@ -10,12 +10,12 @@ use pnet::datalink::{self, NetworkInterface};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HelloMessage {
     message_type: u8,
-    hostname: String,
+    router_ip: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Neighbor {
-    neighbor_id: String,
+    neighbor_ip: String,
     link_up: bool,
     capacity: u32,
 }
@@ -23,13 +23,13 @@ struct Neighbor {
 #[derive(Debug, Serialize, Deserialize)]
 struct LSAMessage {
     message_type: u8,
-    hostname: String,
+    router_ip: String,
     neighbor_count: usize,
     neighbors: Vec<Neighbor>,
 }
 
 struct Router {
-    hostname: String,
+    router_ip: String,
     neighbors: Vec<Neighbor>,
 }
 
@@ -42,8 +42,8 @@ struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let hostname = get_hostname()?;
-    println!("Router hostname: {}", hostname);
+    let router_ip = get_local_ip()?;
+    println!("Router IP: {}", router_ip);
 
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:5000").await?);
     socket.set_broadcast(true)?;
@@ -56,14 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let socket_clone = Arc::clone(&socket);
-    let hostname_clone = hostname.clone();
+    let router_ip_clone = router_ip.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
             let broadcast_addrs = get_broadcast_addresses(5000);
 
             for addr in &broadcast_addrs {
-                if let Err(e) = send_hello(&socket_clone, addr, &hostname_clone).await {
+                if let Err(e) = send_hello(&socket_clone, addr, &router_ip_clone).await {
                     log::error!("Failed to send hello to {}: {}", addr, e);
                 }
             }
@@ -82,31 +82,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         1 => {
                             println!("IN [RECV] HELLO");
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
-                                println!("[RECV] HELLO from {} - {}", hello.hostname, src_addr);
+                                println!("[RECV] HELLO from {} - {}", hello.router_ip, src_addr);
                                 
                                 let mut neighbors = state.neighbors.lock().await;
                                 neighbors.insert(
-                                    hello.hostname.clone(),
+                                    hello.router_ip.clone(),
                                     Neighbor {
-                                        neighbor_id: hello.hostname.clone(),
+                                        neighbor_ip: hello.router_ip.clone(),
                                         link_up: true,
-                                        capacity: 100, // À ajuster si besoin
+                                        capacity: 100,
                                     },
                                 );
-                                drop(neighbors); // Libère le verrou avant l'envoi
+                                drop(neighbors);
 
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &hostname, state.clone()).await {
+                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &router_ip, state.clone()).await {
                                     log::error!("Failed to send LSA: {}", e);
                                 }
                             }
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                println!("[RECV] LSA from {} - {}", lsa.hostname, src_addr);
+                                println!("[RECV] LSA from {} - {}", lsa.router_ip, src_addr);
                                 if let Err(e) = update_topology(state.clone(), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                if let Err(e) = compute_shortest_paths(state.clone(), &lsa.hostname).await {
+                                if let Err(e) = compute_shortest_paths(state.clone(), &lsa.router_ip).await {
                                     log::error!("Failed to compute shortest paths: {}", e);
                                 }
                             }
@@ -124,43 +124,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-
-fn resolve_hostname(hostname: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
-    let addrs = (hostname, 0).to_socket_addrs()?;
-    if let Some(socket_addr) = addrs.filter(|addr| addr.is_ipv4()).next() {
-        if let IpAddr::V4(ipv4_addr) = socket_addr.ip() {
-            return Ok(ipv4_addr);
-        }
-    }
-    Err("Failed to resolve IP address".into())
-}
-
-
-async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, hostname: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let message = HelloMessage {
         message_type: 1,
-        hostname: hostname.to_string(),
+        router_ip: router_ip.to_string(),
     };
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[SEND] HELLO from {} - {}", hostname, addr);
+    println!("[SEND] HELLO from {} - {}", router_ip, addr);
     Ok(())
 }
 
-async fn send_lsa(socket: &UdpSocket, addr: &SocketAddr, hostname: &str, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_lsa(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let neighbors = state.neighbors.lock().await;
     let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
 
     let message = LSAMessage {
         message_type: 2,
-        hostname: hostname.to_string(),
+        router_ip: router_ip.to_string(),
         neighbor_count: neighbors_vec.len(),
         neighbors: neighbors_vec,
     };
 
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[SEND] LSA from {}", hostname);
+    println!("[SEND] LSA from {}", router_ip);
     Ok(())
 }
 
@@ -183,32 +171,37 @@ fn get_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn get_hostname() -> Result<String, Box<dyn std::error::Error>> {
-    let hostname = hostname::get()?;
-    let hostname_str = hostname.into_string().map_err(|os_str| {
-        format!("Failed to convert hostname to string: {:?}", os_str)
-    })?;
-    Ok(hostname_str)
+fn get_local_ip() -> Result<String, Box<dyn std::error::Error>> {
+    let interfaces = datalink::interfaces();
+    for interface in interfaces {
+        for ip_network in interface.ips {
+            if let IpAddr::V4(ipv4) = ip_network.ip() {
+                if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                    return Ok(ipv4.to_string());
+                }
+            }
+        }
+    }
+    Err("No valid IP address found".into())
 }
 
 async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), Box<dyn std::error::Error>> {
     let mut topology = state.topology.lock().await;
     topology.insert(
-        lsa.hostname.clone(),
+        lsa.router_ip.clone(),
         Router {
-            hostname: lsa.hostname.clone(),
+            router_ip: lsa.router_ip.clone(),
             neighbors: lsa.neighbors.clone(),
         },
     );
     Ok(())
 }
 
-
-async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let topology = state.topology.lock().await;
     let mut nodes: HashMap<String, (u32, Option<String>)> = topology
         .keys()
-        .map(|id| (id.clone(), (if id == source_id { 0 } else { u32::MAX }, None)))
+        .map(|id| (id.clone(), (if id == source_ip { 0 } else { u32::MAX }, None)))
         .collect();
 
     let mut visited = Vec::new();
@@ -230,10 +223,10 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
                     let weight = 1000 / neighbor.capacity;
                     let new_cost = nodes[&current].0 + weight;
 
-                    if !nodes.contains_key(&neighbor.neighbor_id) {
-                        nodes.insert(neighbor.neighbor_id.clone(), (new_cost, Some(current.clone())));
-                    } else if new_cost < nodes[&neighbor.neighbor_id].0 {
-                        nodes.insert(neighbor.neighbor_id.clone(), (new_cost, Some(current.clone())));
+                    if !nodes.contains_key(&neighbor.neighbor_ip) {
+                        nodes.insert(neighbor.neighbor_ip.clone(), (new_cost, Some(current.clone())));
+                    } else if new_cost < nodes[&neighbor.neighbor_ip].0 {
+                        nodes.insert(neighbor.neighbor_ip.clone(), (new_cost, Some(current.clone())));
                     }
                 }
             }
@@ -242,12 +235,12 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
         }
     }
 
-    println!("\n=== Routing Table ({}) ===", source_id);
-    for (id, (cost, prev)) in nodes {
-        if id != source_id {
+    println!("\n=== Routing Table ({}) ===", source_ip);
+    for (ip, (cost, prev)) in nodes {
+        if ip != source_ip {
             let gateway = prev.unwrap_or_else(|| "0.0.0.0".to_string());
-            println!("To {} via {} (cost: {})", id, gateway, cost);
-            if let Err(e) = update_routing_table(&id, &gateway).await {
+            println!("To {} via {} (cost: {})", ip, gateway, cost);
+            if let Err(e) = update_routing_table(&ip, &gateway).await {
                 log::error!("Failed to update routing table: {}", e);
             }
         }
@@ -257,13 +250,11 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_id: &str) -> Result
 }
 
 async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Résolution de l'adresse IP pour le destination et le gateway
-    let destination_ip = resolve_hostname(destination)?;
-    let gateway_ip = resolve_hostname(gateway)?;
+    let destination_ip: Ipv4Addr = destination.parse()?;
+    let gateway_ip: Ipv4Addr = gateway.parse()?;
 
     let handle = Handle::new()?;
     
-    // Création de la route avec les adresses IP
     let route = Route::new(IpAddr::V4(destination_ip), 32)
         .with_gateway(IpAddr::V4(gateway_ip));
 
