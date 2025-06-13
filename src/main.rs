@@ -306,9 +306,16 @@ async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Bo
     
     // Calculer l'adresse réseau en appliquant un masque /24 (255.255.255.0)
     let network_addr = Ipv4Addr::from(u32::from(destination_ip) & 0xFFFFFF00);
-    
-    let route = Route::new(IpAddr::V4(network_addr), 24)
-        .with_gateway(IpAddr::V4(gateway_ip));
+
+    // Vérifie si la destination et la gateway sont sur le même réseau
+    let is_direct = (u32::from(destination_ip) & 0xFFFFFF00) == (u32::from(gateway_ip) & 0xFFFFFF00);
+
+    let route = if is_direct {
+        Route::new(IpAddr::V4(network_addr), 24)
+    } else {
+        Route::new(IpAddr::V4(network_addr), 24)
+            .with_gateway(IpAddr::V4(gateway_ip))
+    };
 
     match handle.add(&route).await {
         Ok(_) => println!("Successfully added route to network {}/24 via {}", network_addr, gateway),
