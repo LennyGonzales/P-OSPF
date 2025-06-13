@@ -89,8 +89,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut buf = [0; 2048];
+
+    // Récupère toutes les IP locales (IPv4)
+    let local_ips: Vec<IpAddr> = datalink::interfaces()
+        .into_iter()
+        .flat_map(|iface| iface.ips)
+        .filter_map(|ip_network| {
+            if let IpAddr::V4(ipv4) = ip_network.ip() {
+                Some(IpAddr::V4(ipv4))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
+        // Ignore les paquets venant d'une IP locale
+        if local_ips.contains(&src_addr.ip()) {
+            continue;
+        }
         println!("Received {} bytes from {}", len, src_addr);
 
         match serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
