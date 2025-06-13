@@ -273,11 +273,23 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result
     }
 
     println!("\n=== Routing Table ({}) ===", source_ip);
-    for (ip, (cost, prev)) in nodes {
+    for (ip, (cost, _)) in &nodes {
         if ip != source_ip {
-            let gateway = prev.unwrap_or_else(|| "0.0.0.0".to_string());
+            // Reconstruct path from source to ip
+            let mut path = Vec::new();
+            let mut current = ip;
+            while let Some((_, Some(prev))) = nodes.get(current) {
+                path.push(current.clone());
+                if prev == source_ip {
+                    path.push(prev.clone());
+                    break;
+                }
+                current = prev;
+            }
+            path.reverse();
+            let gateway = if path.len() > 1 { path[1].clone() } else { "0.0.0.0".to_string() };
             println!("To {} via {} (cost: {})", ip, gateway, cost);
-            if let Err(e) = update_routing_table(&ip, &gateway).await {
+            if let Err(e) = update_routing_table(ip, &gateway).await {
                 log::error!("Failed to update routing table: {}", e);
             }
         }
