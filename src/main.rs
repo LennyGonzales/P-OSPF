@@ -38,12 +38,58 @@ struct AppState {
     neighbors: Mutex<HashMap<String, Neighbor>>,
 }
 
+fn get_broadcast_addresses_with_interface_ips(port: u16) -> Vec<(SocketAddr, String)> {
+    let interfaces = datalink::interfaces();
+    interfaces
+        .into_iter()
+        .flat_map(|iface: NetworkInterface| {
+            iface.ips.into_iter().filter_map(move |ip_network| {
+                if let IpAddr::V4(ip) = ip_network.ip() {
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        let prefix_len = ip_network.prefix();
+                        let mask = u32::MAX << (32 - prefix_len);
+                        let broadcast = u32::from(ip) | !mask;
+                        let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port);
+                        Some((broadcast_addr, ip.to_string()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+fn get_local_ips() -> Vec<String> {
+    let interfaces = datalink::interfaces();
+    interfaces
+        .into_iter()
+        .flat_map(|interface| {
+            interface.ips.into_iter().filter_map(|ip_network| {
+                if let IpAddr::V4(ipv4) = ip_network.ip() {
+                    if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                        Some(ipv4.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let router_ip = get_local_ip()?;
+    let local_ips = get_local_ips();
     println!("Router IP: {}", router_ip);
+    println!("Local IPs: {:?}", local_ips);
 
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:5000").await?);
     socket.set_broadcast(true)?;
@@ -56,15 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let socket_clone = Arc::clone(&socket);
-    let router_ip_clone = router_ip.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
-            let broadcast_addrs = get_broadcast_addresses(5000);
+            let broadcast_addrs_with_ips = get_broadcast_addresses_with_interface_ips(5000);
 
-            for addr in &broadcast_addrs {
-                if let Err(e) = send_hello(&socket_clone, addr, &router_ip_clone).await {
-                    log::error!("Failed to send hello to {}: {}", addr, e);
+            for (addr, interface_ip) in &broadcast_addrs_with_ips {
+                if let Err(e) = send_hello(&socket_clone, addr, interface_ip).await {
+                    log::error!("Failed to send hello to {} from interface {}: {}", addr, interface_ip, e);
                 }
             }
         }
@@ -82,6 +127,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         1 => {
                             println!("IN [RECV] HELLO");
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
+                                // Vérifier si le message provient de nous-même
+                                if local_ips.contains(&hello.router_ip) {
+                                    println!("Ignoring HELLO from self: {}", hello.router_ip);
+                                    continue;
+                                }
+
                                 println!("[RECV] HELLO from {} - {}", hello.router_ip, src_addr);
                                 
                                 let mut neighbors = state.neighbors.lock().await;
@@ -95,13 +146,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 drop(neighbors);
 
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &router_ip, state.clone()).await {
-                                    log::error!("Failed to send LSA: {}", e);
+                                // Utiliser l'IP de l'interface appropriée pour la réponse LSA
+                                let broadcast_addrs_with_ips = get_broadcast_addresses_with_interface_ips(5000);
+                                for (addr, interface_ip) in &broadcast_addrs_with_ips {
+                                    if let Err(e) = send_lsa(&socket, addr, interface_ip, state.clone()).await {
+                                        log::error!("Failed to send LSA to {} from interface {}: {}", addr, interface_ip, e);
+                                    }
                                 }
                             }
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
+                                // Vérifier si le message LSA provient de nous-même
+                                if local_ips.contains(&lsa.router_ip) {
+                                    println!("Ignoring LSA from self: {}", lsa.router_ip);
+                                    continue;
+                                }
+
                                 println!("[RECV] LSA from {} - {}", lsa.router_ip, src_addr);
                                 if let Err(e) = update_topology(state.clone(), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
@@ -159,10 +220,14 @@ fn get_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
         .flat_map(|iface: NetworkInterface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ip) = ip_network.ip() {
-                    let prefix_len = ip_network.prefix();
-                    let mask = u32::MAX << (32 - prefix_len);
-                    let broadcast = u32::from(ip) | !mask;
-                    Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port))
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        let prefix_len = ip_network.prefix();
+                        let mask = u32::MAX << (32 - prefix_len);
+                        let broadcast = u32::from(ip) | !mask;
+                        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
