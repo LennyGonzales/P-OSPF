@@ -255,16 +255,19 @@ async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Bo
 
     let handle = Handle::new()?;
     
-    let route = Route::new(IpAddr::V4(destination_ip), 32)
+    // Calculer l'adresse réseau en appliquant un masque /24 (255.255.255.0)
+    let network_addr = Ipv4Addr::from(u32::from(destination_ip) & 0xFFFFFF00);
+    
+    let route = Route::new(IpAddr::V4(network_addr), 24)
         .with_gateway(IpAddr::V4(gateway_ip));
 
     match handle.add(&route).await {
-        Ok(_) => println!("Successfully added route to {} via {}", destination, gateway),
+        Ok(_) => println!("Successfully added route to network {}/24 via {}", network_addr, gateway),
         Err(e) => {
-            log::warn!("Failed to add route to {} via {}: {}", destination, gateway, e);
+            log::warn!("Failed to add route to network {}/24 via {}: {}", network_addr, gateway, e);
             let _ = handle.delete(&route).await;
             handle.add(&route).await?;
-            println!("Successfully updated route to {} via {}", destination, gateway);
+            println!("Successfully updated route to network {}/24 via {}", network_addr, gateway);
         }
     }
 
