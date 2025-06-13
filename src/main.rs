@@ -28,6 +28,29 @@ struct LSAMessage {
     neighbors: Vec<Neighbor>,
 }
 
+// Nouveau message pour demander la table de routage
+#[derive(Debug, Serialize, Deserialize)]
+struct RoutingTableRequest {
+    message_type: u8,
+    router_ip: String,
+}
+
+// Nouveau message pour répondre avec la table de routage
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RoutingEntry {
+    destination: String,
+    next_hop: String,
+    metric: u32,
+    hop_count: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RoutingTableResponse {
+    message_type: u8,
+    router_ip: String,
+    routing_table: Vec<RoutingEntry>,
+}
+
 struct Router {
     router_ip: String,
     neighbors: Vec<Neighbor>,
@@ -36,6 +59,7 @@ struct Router {
 struct AppState {
     topology: Mutex<HashMap<String, Router>>,
     neighbors: Mutex<HashMap<String, Neighbor>>,
+    routing_table: Mutex<HashMap<String, RoutingEntry>>, // Nouvelle table de routage locale
 }
 
 fn get_broadcast_addresses_with_interface_ips(port: u16) -> Vec<(SocketAddr, String)> {
@@ -99,8 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         topology: Mutex::new(HashMap::new()),
         neighbors: Mutex::new(HashMap::new()),
+        routing_table: Mutex::new(HashMap::new()), // Initialiser la table de routage
     });
 
+    // Task pour envoyer les HELLO messages
     let socket_clone = Arc::clone(&socket);
     tokio::spawn(async move {
         loop {
@@ -115,7 +141,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut buf = [0; 2048];
+    // Nouvelle task pour demander les tables de routage
+    let socket_clone2 = Arc::clone(&socket);
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let broadcast_addrs_with_ips = get_broadcast_addresses_with_interface_ips(5000);
+
+            for (addr, interface_ip) in &broadcast_addrs_with_ips {
+                if let Err(e) = send_routing_table_request(&socket_clone2, addr, interface_ip).await {
+                    log::error!("Failed to send routing table request to {} from interface {}: {}", addr, interface_ip, e);
+                }
+            }
+        }
+    });
+
+    let mut buf = [0; 4096]; // Augmenter la taille du buffer pour les tables de routage
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
         println!("Received {} bytes from {}", len, src_addr);
@@ -146,7 +188,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 drop(neighbors);
 
-                                // Utiliser l'IP de l'interface appropriée pour la réponse LSA
                                 let broadcast_addrs_with_ips = get_broadcast_addresses_with_interface_ips(5000);
                                 for (addr, interface_ip) in &broadcast_addrs_with_ips {
                                     if let Err(e) = send_lsa(&socket, addr, interface_ip, state.clone()).await {
@@ -157,7 +198,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                // Vérifier si le message LSA provient de nous-même
                                 if local_ips.contains(&lsa.router_ip) {
                                     println!("Ignoring LSA from self: {}", lsa.router_ip);
                                     continue;
@@ -169,6 +209,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if let Err(e) = compute_shortest_paths(state.clone(), &lsa.router_ip).await {
                                     log::error!("Failed to compute shortest paths: {}", e);
+                                }
+                            }
+                        }
+                        3 => {
+                            // Nouvelle gestion des demandes de table de routage
+                            if let Ok(request) = serde_json::from_value::<RoutingTableRequest>(json) {
+                                if local_ips.contains(&request.router_ip) {
+                                    println!("Ignoring routing table request from self: {}", request.router_ip);
+                                    continue;
+                                }
+
+                                println!("[RECV] Routing table request from {}", request.router_ip);
+                                
+                                // Répondre avec notre table de routage
+                                let broadcast_addrs_with_ips = get_broadcast_addresses_with_interface_ips(5000);
+                                for (addr, interface_ip) in &broadcast_addrs_with_ips {
+                                    if let Err(e) = send_routing_table_response(&socket, addr, interface_ip, state.clone()).await {
+                                        log::error!("Failed to send routing table response to {} from interface {}: {}", addr, interface_ip, e);
+                                    }
+                                }
+                            }
+                        }
+                        4 => {
+                            // Nouvelle gestion des réponses de table de routage
+                            if let Ok(response) = serde_json::from_value::<RoutingTableResponse>(json) {
+                                if local_ips.contains(&response.router_ip) {
+                                    println!("Ignoring routing table response from self: {}", response.router_ip);
+                                    continue;
+                                }
+
+                                println!("[RECV] Routing table response from {}", response.router_ip);
+                                if let Err(e) = update_routing_table_from_neighbor(state.clone(), &response, &local_ips).await {
+                                    log::error!("Failed to update routing table from neighbor: {}", e);
                                 }
                             }
                         }
@@ -211,6 +284,123 @@ async fn send_lsa(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str, state:
     socket.send_to(&serialized, addr).await?;
     println!("[SEND] LSA from {}", router_ip);
     Ok(())
+}
+
+// Nouvelle fonction pour envoyer une demande de table de routage
+async fn send_routing_table_request(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let message = RoutingTableRequest {
+        message_type: 3,
+        router_ip: router_ip.to_string(),
+    };
+    let serialized = serde_json::to_vec(&message)?;
+    socket.send_to(&serialized, addr).await?;
+    println!("[SEND] Routing table request from {} - {}", router_ip, addr);
+    Ok(())
+}
+
+// Nouvelle fonction pour envoyer une réponse de table de routage
+async fn send_routing_table_response(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let routing_table = state.routing_table.lock().await;
+    let routing_entries = routing_table.values().cloned().collect::<Vec<_>>();
+
+    let message = RoutingTableResponse {
+        message_type: 4,
+        router_ip: router_ip.to_string(),
+        routing_table: routing_entries,
+    };
+
+    let serialized = serde_json::to_vec(&message)?;
+    socket.send_to(&serialized, addr).await?;
+    println!("[SEND] Routing table response from {} with {} entries", router_ip, routing_table.len());
+    Ok(())
+}
+
+// Nouvelle fonction pour mettre à jour la table de routage à partir des voisins
+async fn update_routing_table_from_neighbor(
+    state: Arc<AppState>, 
+    response: &RoutingTableResponse, 
+    local_ips: &[String]
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut routing_table = state.routing_table.lock().await;
+    let neighbors = state.neighbors.lock().await;
+    
+    // Vérifier que le routeur qui répond est bien un voisin direct
+    if !neighbors.contains_key(&response.router_ip) {
+        log::warn!("Received routing table from non-neighbor: {}", response.router_ip);
+        return Ok(());
+    }
+    
+    for entry in &response.routing_table {
+        // Éviter les boucles : ne pas ajouter de routes vers nous-mêmes
+        if local_ips.contains(&entry.destination) {
+            continue;
+        }
+        
+        // Éviter les boucles : ne pas ajouter de routes qui passent par nous
+        if local_ips.contains(&entry.next_hop) {
+            continue;
+        }
+        
+        // Calculer la nouvelle métrique (distance + 1 hop)
+        let new_metric = entry.metric + 1;
+        let new_hop_count = entry.hop_count + 1;
+        
+        // Éviter les boucles de routage en limitant le nombre de hops (algorithme RIP)
+        if new_hop_count > 15 {
+            continue;
+        }
+        
+        let new_entry = RoutingEntry {
+            destination: entry.destination.clone(),
+            next_hop: response.router_ip.clone(), // Le prochain saut est le voisin qui nous a envoyé cette route
+            metric: new_metric,
+            hop_count: new_hop_count,
+        };
+        
+        // Mettre à jour seulement si on n'a pas de route ou si la nouvelle route est meilleure
+        match routing_table.get(&entry.destination) {
+            Some(existing_entry) => {
+                if new_metric < existing_entry.metric {
+                    println!("Updating route to {} via {} (metric: {} -> {})", 
+                             entry.destination, response.router_ip, existing_entry.metric, new_metric);
+                    routing_table.insert(entry.destination.clone(), new_entry.clone());
+                    
+                    // Mettre à jour la table de routage système
+                    if let Err(e) = update_routing_table(&entry.destination, &response.router_ip).await {
+                        log::error!("Failed to update system routing table for {}: {}", entry.destination, e);
+                    }
+                }
+            }
+            None => {
+                println!("Adding new route to {} via {} (metric: {})", 
+                         entry.destination, response.router_ip, new_metric);
+                routing_table.insert(entry.destination.clone(), new_entry.clone());
+                
+                // Mettre à jour la table de routage système
+                if let Err(e) = update_routing_table(&entry.destination, &response.router_ip).await {
+                    log::error!("Failed to update system routing table for {}: {}", entry.destination, e);
+                }
+            }
+        }
+    }
+    
+    drop(routing_table);
+    drop(neighbors);
+    
+    // Afficher la table de routage mise à jour
+    print_routing_table(state).await;
+    Ok(())
+}
+
+// Nouvelle fonction pour afficher la table de routage
+async fn print_routing_table(state: Arc<AppState>) {
+    let routing_table = state.routing_table.lock().await;
+    println!("\n=== Current Routing Table ===");
+    for (destination, entry) in routing_table.iter() {
+        println!("To {} via {} (metric: {}, hops: {})", 
+                 destination, entry.next_hop, entry.metric, entry.hop_count);
+    }
+    println!("=============================\n");
 }
 
 fn get_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
@@ -375,13 +565,23 @@ async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result
     }
 
     println!("\n=== Routing Table ({}) ===", source_ip);
+    let mut routing_table = state.routing_table.lock().await;
+    
     for (ip, (cost, prev)) in nodes {
         if ip != source_ip {
             if let Some(gateway) = prev {
-                // Seulement ajouter des routes vers des gateways directs (voisins)
                 let neighbors = state.neighbors.lock().await;
                 if neighbors.contains_key(&gateway) {
                     println!("To {} via {} (cost: {})", ip, gateway, cost);
+                    
+                    // Mettre à jour notre table de routage locale
+                    routing_table.insert(ip.clone(), RoutingEntry {
+                        destination: ip.clone(),
+                        next_hop: gateway.clone(),
+                        metric: cost,
+                        hop_count: 1,
+                    });
+                    
                     if let Err(e) = update_routing_table(&ip, &gateway).await {
                         log::error!("Failed to update routing table for {}: {}", ip, e);
                     }
