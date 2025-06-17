@@ -128,17 +128,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 drop(neighbors);
 
                                 // Get the local address of the interface that received the Hello message
-                                if let Ok(local_addr) = socket.local_addr() {
-                                    let local_ip_str = match local_addr.ip() {
-                                        std::net::IpAddr::V4(ipv4) => ipv4.to_string(),
-                                        std::net::IpAddr::V6(ipv6) => ipv6.to_string(),
-                                    };
-                                    // Create a new socket bound to the same interface (local address)
-                                    if let Ok(interface_socket) = UdpSocket::bind(local_addr).await {
+                                let mut found_local_ip = None;
+                                if let std::net::SocketAddr::V4(src_v4) = src_addr {
+                                    let interfaces = pnet::datalink::interfaces();
+                                    for iface in interfaces {
+                                        for ip_network in iface.ips {
+                                            if let IpAddr::V4(local_ip) = ip_network.ip() {
+                                                // Vérifie si src_addr et local_ip sont sur le même réseau /24
+                                                if (u32::from(*src_v4.ip()) & 0xFFFFFF00) == (u32::from(local_ip) & 0xFFFFFF00) {
+                                                    found_local_ip = Some(local_ip.to_string());
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if found_local_ip.is_some() { break; }
+                                    }
+                                }
+                                if let Some(local_ip_str) = found_local_ip {
+                                    if let Ok(interface_socket) = UdpSocket::bind(format!("{}:0", local_ip_str)).await {
                                         if let Err(e) = send_lsa(&interface_socket, &broadcast_addr, &local_ip_str, state.clone()).await {
                                             log::error!("Failed to send LSA: {}", e);
                                         }
                                     }
+                                } else {
+                                    log::warn!("No matching local interface found for src_addr {}", src_addr);
                                 }
                             }
                         }
