@@ -24,6 +24,8 @@ struct Neighbor {
 struct LSAMessage {
     message_type: u8,
     router_ip: String,
+    last_hop: Option<String>, // Le dernier routeur par lequel le message est passé
+    originator: String,       // Le routeur qui émet originalement la LSA
     neighbor_count: usize,
     neighbors: Vec<Neighbor>,
 }
@@ -36,6 +38,7 @@ struct Router {
 struct AppState {
     topology: Mutex<HashMap<String, Router>>,
     neighbors: Mutex<HashMap<String, Neighbor>>,
+    routing_table: Mutex<HashMap<String, String>>, // destination -> next_hop
 }
 
 fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
@@ -72,9 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         topology: Mutex::new(HashMap::new()),
         neighbors: Mutex::new(HashMap::new()),
+        routing_table: Mutex::new(HashMap::new()),
     });
 
     let socket_clone = Arc::clone(&socket);
+    let router_ip_clone = router_ip.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
@@ -131,20 +136,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 drop(neighbors);
 
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &router_ip, state.clone()).await {
+                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &router_ip, None, &router_ip, state.clone()).await {
                                     log::error!("Failed to send LSA: {}", e);
                                 }
                             }
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                println!("[RECV] LSA from {} - {}", lsa.router_ip, src_addr);
+                                println!("[RECV] LSA from {} (originator: {}, last_hop: {:?})", 
+                                    src_addr, lsa.originator, lsa.last_hop);
+                                
+                                // Mettre à jour la table de routage en fonction des informations LSA
+                                if let Err(e) = update_routing_from_lsa(state.clone(), &lsa, &src_addr.ip().to_string()).await {
+                                    log::error!("Failed to update routing from LSA: {}", e);
+                                }
+                                
                                 if let Err(e) = update_topology(state.clone(), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                // Correction : toujours calculer la table de routage depuis l'IP locale
-                                if let Err(e) = compute_shortest_paths(state.clone(), &router_ip).await {
-                                    log::error!("Failed to compute shortest paths: {}", e);
+                                
+                                // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
+                                if lsa.originator != router_ip {
+                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &router_ip, &lsa, state.clone()).await {
+                                        log::error!("Failed to forward LSA: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -172,20 +187,51 @@ async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str) -> R
     Ok(())
 }
 
-async fn send_lsa(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_lsa(
+    socket: &UdpSocket, 
+    addr: &SocketAddr, 
+    router_ip: &str, 
+    last_hop: Option<&str>,
+    originator: &str,
+    state: Arc<AppState>
+) -> Result<(), Box<dyn std::error::Error>> {
     let neighbors = state.neighbors.lock().await;
     let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
 
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
+        last_hop: last_hop.map(|s| s.to_string()),
+        originator: originator.to_string(),
         neighbor_count: neighbors_vec.len(),
         neighbors: neighbors_vec,
     };
 
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[SEND] LSA from {}", router_ip);
+    println!("[SEND] LSA from {} (originator: {}, last_hop: {:?})", router_ip, originator, last_hop);
+    Ok(())
+}
+
+async fn forward_lsa(
+    socket: &UdpSocket,
+    addr: &SocketAddr,
+    router_ip: &str,
+    original_lsa: &LSAMessage,
+    state: Arc<AppState>
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = LSAMessage {
+        message_type: 2,
+        router_ip: router_ip.to_string(),
+        last_hop: Some(router_ip.to_string()),
+        originator: original_lsa.originator.clone(),
+        neighbor_count: original_lsa.neighbor_count,
+        neighbors: original_lsa.neighbors.clone(),
+    };
+
+    let serialized = serde_json::to_vec(&message)?;
+    socket.send_to(&serialized, addr).await?;
+    println!("[FORWARD] LSA from {} (originator: {})", router_ip, original_lsa.originator);
     Ok(())
 }
 
@@ -222,12 +268,54 @@ fn get_local_ip() -> Result<String, Box<dyn std::error::Error>> {
     Err("No valid IP address found".into())
 }
 
+async fn update_routing_from_lsa(
+    state: Arc<AppState>,
+    lsa: &LSAMessage,
+    sender_ip: &str
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut routing_table = state.routing_table.lock().await;
+    
+    // Si c'est une LSA originale (pas de last_hop), le next_hop est l'expéditeur
+    let next_hop = if lsa.last_hop.is_none() {
+        sender_ip.to_string()
+    } else {
+        // Si la LSA a un last_hop, utiliser l'expéditeur comme next_hop
+        sender_ip.to_string()
+    };
+    
+    // Mettre à jour la route vers l'originateur de la LSA
+    if lsa.originator != sender_ip {
+        routing_table.insert(lsa.originator.clone(), next_hop.clone());
+        println!("Updated route: {} -> next_hop: {}", lsa.originator, next_hop);
+        
+        // Mettre à jour la table de routage système
+        if let Err(e) = update_routing_table(&lsa.originator, &next_hop).await {
+            log::error!("Failed to update system routing table: {}", e);
+        }
+    }
+    
+    // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
+    for neighbor in &lsa.neighbors {
+        if neighbor.link_up && !routing_table.contains_key(&neighbor.neighbor_ip) {
+            routing_table.insert(neighbor.neighbor_ip.clone(), next_hop.clone());
+            println!("Updated route: {} -> next_hop: {}", neighbor.neighbor_ip, next_hop);
+            
+            // Mettre à jour la table de routage système
+            if let Err(e) = update_routing_table(&neighbor.neighbor_ip, &next_hop).await {
+                log::error!("Failed to update system routing table: {}", e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), Box<dyn std::error::Error>> {
     let mut topology = state.topology.lock().await;
     topology.insert(
-        lsa.router_ip.clone(),
+        lsa.originator.clone(),
         Router {
-            router_ip: lsa.router_ip.clone(),
+            router_ip: lsa.originator.clone(),
             neighbors: lsa.neighbors.clone(),
         },
     );
@@ -236,65 +324,14 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), B
 
 async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let topology = state.topology.lock().await;
-    let mut nodes: HashMap<String, (u32, Option<String>)> = topology
-        .keys()
-        .map(|id| (id.clone(), (if id == source_ip { 0 } else { u32::MAX }, None)))
-        .collect();
-
-    let mut visited = Vec::new();
-    while visited.len() < topology.len() {
-        let current_node = nodes
-            .iter()
-            .filter(|(id, _)| !visited.contains(*id))
-            .min_by_key(|(_, (cost, _))| *cost)
-            .map(|(id, _)| id.clone());
-
-        if let Some(current) = current_node {
-            visited.push(current.clone());
-            if let Some(router) = topology.get(&current) {
-                for neighbor in &router.neighbors {
-                    if !neighbor.link_up {
-                        continue;
-                    }
-
-                    let weight = 1000 / neighbor.capacity;
-                    let new_cost = nodes[&current].0 + weight;
-
-                    if !nodes.contains_key(&neighbor.neighbor_ip) {
-                        nodes.insert(neighbor.neighbor_ip.clone(), (new_cost, Some(current.clone())));
-                    } else if new_cost < nodes[&neighbor.neighbor_ip].0 {
-                        nodes.insert(neighbor.neighbor_ip.clone(), (new_cost, Some(current.clone())));
-                    }
-                }
-            }
-        } else {
-            break;
-        }
+    let routing_table = state.routing_table.lock().await;
+    
+    println!("\n=== Current Routing Table ({}) ===", source_ip);
+    for (destination, next_hop) in routing_table.iter() {
+        println!("To {} via {}", destination, next_hop);
     }
-
-    println!("\n=== Routing Table ({}) ===", source_ip);
-    for (ip, (cost, _)) in &nodes {
-        if ip != source_ip {
-            // Reconstruct path from source to ip
-            let mut path = Vec::new();
-            let mut current = ip;
-            while let Some((_, Some(prev))) = nodes.get(current) {
-                path.push(current.clone());
-                if prev == source_ip {
-                    path.push(prev.clone());
-                    break;
-                }
-                current = prev;
-            }
-            path.reverse();
-            let gateway = if path.len() > 1 { path[1].clone() } else { "0.0.0.0".to_string() };
-            println!("To {} via {} (cost: {})", ip, gateway, cost);
-            if let Err(e) = update_routing_table(ip, &gateway).await {
-                log::error!("Failed to update routing table: {}", e);
-            }
-        }
-    }
-    println!("\n==========================");
+    println!("==================================\n");
+    
     Ok(())
 }
 
