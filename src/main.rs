@@ -33,12 +33,6 @@ struct LSAMessage {
     neighbors: Vec<Neighbor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LSAKey {
-    originator: String,
-    sequence_number: u32,
-}
-
 struct Router {
     router_ip: String,
     neighbors: Vec<Neighbor>,
@@ -48,7 +42,6 @@ struct AppState {
     topology: Mutex<HashMap<String, Router>>,
     neighbors: Mutex<HashMap<String, Neighbor>>,
     routing_table: Mutex<HashMap<String, String>>, // destination -> next_hop
-    lsa_cache: Mutex<HashMap<LSAKey, std::time::Instant>>, // Cache des LSA déjà vues
     sequence_number: Mutex<u32>, // Numéro de séquence pour les LSA émises par ce routeur
 }
 
@@ -88,29 +81,7 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), B
     Ok(())
 }
 
-// Fonction pour vérifier si une LSA a déjà été vue (évite les boucles)
-async fn is_lsa_already_seen(state: Arc<AppState>, lsa: &LSAMessage) -> bool {
-    let mut cache = state.lsa_cache.lock().await;
-    let key = LSAKey {
-        originator: lsa.originator.clone(),
-        sequence_number: lsa.sequence_number,
-    };
-    
-    // Nettoyer les entrées anciennes (plus de 30 secondes)
-    let now = std::time::Instant::now();
-    cache.retain(|_, timestamp| now.duration_since(*timestamp).as_secs() < 30);
-    
-    // Vérifier si cette LSA a déjà été vue
-    if cache.contains_key(&key) {
-        true
-    } else {
-        cache.insert(key, now);
-        false
-    }
-}
-
-// Fonction pour obtenir le prochain numéro de séquence
-async fn get_next_sequence_number(state: Arc<AppState>) -> u32 {
+fn get_next_sequence_number(state: Arc<AppState>) -> u32 {
     let mut seq = state.sequence_number.lock().await;
     *seq += 1;
     *seq
@@ -130,7 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         topology: Mutex::new(HashMap::new()),
         neighbors: Mutex::new(HashMap::new()),
         routing_table: Mutex::new(HashMap::new()),
-        lsa_cache: Mutex::new(HashMap::new()),
         sequence_number: Mutex::new(0),
     });
 
@@ -144,22 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = send_hello(&socket_clone, addr, local_ip).await {
                     log::error!("Failed to send hello to {}: {}", addr, e);
                 }
-            }
-        }
-    });
-
-    // Tâche de nettoyage du cache LSA
-    let state_clone = Arc::clone(&state);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await; // Nettoyer toutes les minutes
-            let mut cache = state_clone.lsa_cache.lock().await;
-            let now = std::time::Instant::now();
-            let initial_size = cache.len();
-            cache.retain(|_, timestamp| now.duration_since(*timestamp).as_secs() < 120); // Garder pendant 2 minutes
-            let final_size = cache.len();
-            if initial_size != final_size {
-                println!("LSA cache cleanup: {} -> {} entries", initial_size, final_size);
             }
         }
     });
@@ -234,13 +188,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Vérifier le TTL
                                 if lsa.ttl == 0 {
                                     println!("LSA TTL expired, dropping message");
-                                    continue;
-                                }
-                                
-                                // Vérifier si cette LSA a déjà été vue (évite les boucles)
-                                if is_lsa_already_seen(Arc::clone(&state), &lsa).await {
-                                    println!("LSA already seen (originator: {}, seq: {}), dropping to avoid loop", 
-                                        lsa.originator, lsa.sequence_number);
                                     continue;
                                 }
                                 
