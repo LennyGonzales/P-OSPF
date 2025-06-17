@@ -284,8 +284,8 @@ async fn send_lsa(
     let topology = state.topology.lock().await;
     for router in topology.values() {
         for neighbor in &router.neighbors {
-            // On évite les doublons (par IP)
-            if seen.insert(neighbor.neighbor_ip.clone()) {
+            // On évite les doublons (par IP) et on évite d'ajouter le routeur lui-même
+            if neighbor.neighbor_ip != router_ip && seen.insert(neighbor.neighbor_ip.clone()) {
                 all_neighbors.push(neighbor.clone());
             }
         }
