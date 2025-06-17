@@ -145,10 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 if let Some(local_ip_str) = found_local_ip {
-                                    if let Ok(interface_socket) = UdpSocket::bind(format!("{}:0", local_ip_str)).await {
-                                        if let Err(e) = send_lsa(&interface_socket, &broadcast_addr, &local_ip_str, state.clone()).await {
-                                            log::error!("Failed to send LSA: {}", e);
-                                        }
+                                    if let Err(e) = send_lsa(&socket, &broadcast_addr, &local_ip_str, state.clone()).await {
+                                        log::error!("Failed to send LSA: {}", e);
                                     }
                                 } else {
                                     log::warn!("No matching local interface found for src_addr {}", src_addr);
