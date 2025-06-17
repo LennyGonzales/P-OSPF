@@ -260,16 +260,27 @@ async fn send_lsa(
     originator: &str,
     state: Arc<AppState>
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let neighbors = state.neighbors.lock().await;
-    let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
+    // Récupérer tous les voisins connus dans la topologie
+    let topology = state.topology.lock().await;
+    let mut all_neighbors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for router in topology.values() {
+        for neighbor in &router.neighbors {
+            // On évite les doublons (par IP)
+            if seen.insert(neighbor.neighbor_ip.clone()) {
+                all_neighbors.push(neighbor.clone());
+            }
+        }
+    }
+    drop(topology);
 
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
         last_hop: last_hop.map(|s| s.to_string()),
         originator: originator.to_string(),
-        neighbor_count: neighbors_vec.len(),
-        neighbors: neighbors_vec,
+        neighbor_count: all_neighbors.len(),
+        neighbors: all_neighbors,
     };
 
     let serialized = serde_json::to_vec(&message)?;

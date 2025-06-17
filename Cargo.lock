@@ -51,7 +51,7 @@ checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -92,7 +92,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -214,7 +214,7 @@ checksum = "162ee34ebcb7c64a8abebc059ce0fee27c2262618d7b60ed8faf72fef13c3650"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -281,6 +281,15 @@ name = "humantime"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b112acc8b3adf4b107a8ec20977da0273a8c386765a3ec0229bd500a1443f9f"
+
+[[package]]
+name = "ipnetwork"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is-terminal"
@@ -471,6 +480,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "no-std-net"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,13 +546,104 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
+name = "pnet"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd959a8268165518e2bf5546ba84c7b3222744435616381df3c456fe8d983576"
+dependencies = [
+ "ipnetwork",
+ "pnet_base",
+ "pnet_datalink",
+ "pnet_packet",
+ "pnet_sys",
+ "pnet_transport",
+]
+
+[[package]]
+name = "pnet_base"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "872e46346144ebf35219ccaa64b1dffacd9c6f188cd7d012bd6977a2a838f42e"
+dependencies = [
+ "no-std-net",
+]
+
+[[package]]
+name = "pnet_datalink"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c302da22118d2793c312a35fb3da6846cb0fab6c3ad53fd67e37809b06cdafce"
+dependencies = [
+ "ipnetwork",
+ "libc",
+ "pnet_base",
+ "pnet_sys",
+ "winapi",
+]
+
+[[package]]
+name = "pnet_macros"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a780e80005c2e463ec25a6e9f928630049a10b43945fea83207207d4a7606f4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "pnet_macros_support"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6d932134f32efd7834eb8b16d42418dac87086347d1bc7d142370ef078582bc"
+dependencies = [
+ "pnet_base",
+]
+
+[[package]]
+name = "pnet_packet"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bde678bbd85cb1c2d99dc9fc596e57f03aa725f84f3168b0eaf33eeccb41706"
+dependencies = [
+ "glob",
+ "pnet_base",
+ "pnet_macros",
+ "pnet_macros_support",
+]
+
+[[package]]
+name = "pnet_sys"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf7a58b2803d818a374be9278a1fe8f88fce14b936afbe225000cfcd9c73f16"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
+name = "pnet_transport"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "813d1c0e4defbe7ee22f6fe1755f122b77bfb5abe77145b1b5baaf463cab9249"
+dependencies = [
+ "libc",
+ "pnet_base",
+ "pnet_packet",
+ "pnet_sys",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9dee91521343f4c5c6a63edd65e54f31f5c92fe8978c40a4282f8372194c6a7d"
 dependencies = [
  "proc-macro2",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -604,6 +710,7 @@ dependencies = [
  "hostname",
  "log",
  "net-route",
+ "pnet",
  "serde",
  "serde_json",
  "tokio",
@@ -668,7 +775,7 @@ checksum = "5b0276cf7f2c73365f7157c8123c21cd9a50fbbd844757af28ca1f5925fc2a00"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -725,6 +832,17 @@ dependencies = [
 
 [[package]]
 name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
 version = "2.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ce2b7fc941b3a24138a0a7cf8e858bfc6a992e7978a068a5c760deb0ed43caf"
@@ -769,7 +887,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -780,7 +898,7 @@ checksum = "7f7cf42b4507d8ea322120659672cf1b9dbb93f8f2d4ecfd6e51350ff5b17a1d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -809,7 +927,7 @@ checksum = "6e06d43f1345a3bcd39f6a56dbb7dcab2ba47e68e8ac134855e7e2bdbaf8cab8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.101",
 ]
 
 [[package]]
