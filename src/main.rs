@@ -30,7 +30,7 @@ struct LSAMessage {
     originator: String,       // Le routeur qui émet originalement la LSA
     neighbor_count: usize,
     neighbors: Vec<Neighbor>,
-    known_routes: HashMap<String, String>, // destination -> next_hop
+    known_routes: HashMap<String, (String, u32)>, // destination -> (next_hop, metric)
 }
 
 struct Router {
@@ -41,7 +41,7 @@ struct Router {
 struct AppState {
     topology: Mutex<HashMap<String, Router>>,
     neighbors: Mutex<HashMap<String, Neighbor>>,
-    routing_table: Mutex<HashMap<String, String>>, // destination -> next_hop
+    routing_table: Mutex<HashMap<String, (String, u32)>>, // destination -> (next_hop, metric)
 }
 
 fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
 
                                 // Mettre à jour la table de routage en fonction des informations LSA
-                                if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string(), &local_ips).await {
+                                if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string(), &local_ips, &receiving_interface_ip).await {
                                     log::error!("Failed to update routing from LSA: {}", e);
                                 }
 
@@ -282,18 +282,79 @@ async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str) -> R
     Ok(())
 }
 
+// --- update_routing_from_lsa corrigé ---
+async fn update_routing_from_lsa(
+    state: Arc<AppState>,
+    lsa: &LSAMessage,
+    sender_ip: &str,
+    local_ips: &HashMap<IpAddr, String>,
+    receiving_interface_ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut routing_table = state.routing_table.lock().await;
+
+    // 1. Ajoute/Met à jour la route vers l'originator (1 saut)
+    if lsa.originator != sender_ip {
+        routing_table.insert(lsa.originator.clone(), (sender_ip.to_string(), 1));
+        println!("Updated route: {} -> next_hop: {}, metric: 1", lsa.originator, sender_ip);
+
+        if let Err(e) = update_routing_table_safe(&lsa.originator, sender_ip).await {
+            log::warn!("Could not update system routing table for {}: {}", lsa.originator, e);
+        }
+    }
+
+    // 2. Ajoute/Met à jour les routes vers les voisins du LSA (1 saut)
+    for neighbor in &lsa.neighbors {
+        if neighbor.link_up && neighbor.neighbor_ip != sender_ip {
+            routing_table.insert(neighbor.neighbor_ip.clone(), (sender_ip.to_string(), 1));
+            println!("Updated route: {} -> next_hop: {}, metric: 1", neighbor.neighbor_ip, sender_ip);
+
+            if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, sender_ip).await {
+                log::warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
+            }
+        }
+    }
+
+    // 3. Ajoute/Met à jour les routes apprises (incrémente la métrique)
+    for (dest, (lsa_next_hop, lsa_metric)) in &lsa.known_routes {
+        // Ignore les adresses locales
+        if let Ok(dest_ip) = dest.parse::<IpAddr>() {
+            if local_ips.contains_key(&dest_ip) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        // Split horizon : ne pas annoncer la route par l'interface par laquelle on l'a apprise
+        if lsa_next_hop == receiving_interface_ip {
+            continue;
+        }
+        let new_metric = lsa_metric + 1;
+        let update = match routing_table.get(dest) {
+            Some((_, current_metric)) => new_metric < *current_metric,
+            None => true,
+        };
+        if update {
+            routing_table.insert(dest.clone(), (sender_ip.to_string(), new_metric));
+            println!("Updated route from LSA known_routes: {} -> next_hop: {}, metric: {}", dest, sender_ip, new_metric);
+            if let Err(e) = update_routing_table_safe(dest, sender_ip).await {
+                log::warn!("Could not update system routing table for {}: {}", dest, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+// --- send_lsa et forward_lsa corrigés pour toujours propager toutes les routes connues ---
 async fn send_lsa(
-    socket: &UdpSocket, 
-    addr: &SocketAddr, 
-    router_ip: &str, 
+    socket: &UdpSocket,
+    addr: &SocketAddr,
+    router_ip: &str,
     last_hop: Option<&str>,
     originator: &str,
-    state: Arc<AppState>
+    state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let neighbors = state.neighbors.lock().await;
     let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
-    
-    // Inclure toutes les routes connues
     let routing_table = state.routing_table.lock().await;
     let known_routes = routing_table.clone();
 
@@ -304,7 +365,7 @@ async fn send_lsa(
         originator: originator.to_string(),
         neighbor_count: neighbors_vec.len(),
         neighbors: neighbors_vec,
-        known_routes: known_routes,
+        known_routes,
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -313,15 +374,13 @@ async fn send_lsa(
     Ok(())
 }
 
-// Modifier également forward_lsa pour inclure les routes
 async fn forward_lsa(
     socket: &UdpSocket,
     addr: &SocketAddr,
     router_ip: &str,
     original_lsa: &LSAMessage,
-    state: Arc<AppState>
+    state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Inclure les routes connues
     let routing_table = state.routing_table.lock().await;
     let known_routes = routing_table.clone();
 
@@ -332,7 +391,7 @@ async fn forward_lsa(
         originator: original_lsa.originator.clone(),
         neighbor_count: original_lsa.neighbor_count,
         neighbors: original_lsa.neighbors.clone(),
-        known_routes: original_lsa.known_routes.clone(), // Propager les routes du LSA original
+        known_routes,
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -346,7 +405,8 @@ async fn update_routing_from_lsa(
     state: Arc<AppState>,
     lsa: &LSAMessage,
     sender_ip: &str,
-    local_ips: &HashMap<IpAddr, String>
+    local_ips: &HashMap<IpAddr, String>,
+    receiving_interface_ip: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut routing_table = state.routing_table.lock().await;
     
@@ -360,7 +420,7 @@ async fn update_routing_from_lsa(
     
     // Mettre à jour la route vers l'originateur de la LSA
     if lsa.originator != sender_ip {
-        routing_table.insert(lsa.originator.clone(), next_hop.clone());
+        routing_table.insert(lsa.originator.clone(), (next_hop.clone(), 1)); // Metric = 1
         println!("Updated route: {} -> next_hop: {}", lsa.originator, next_hop);
         
         if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
@@ -371,7 +431,7 @@ async fn update_routing_from_lsa(
     // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
     for neighbor in &lsa.neighbors {
         if neighbor.link_up && neighbor.neighbor_ip != sender_ip {
-            routing_table.insert(neighbor.neighbor_ip.clone(), next_hop.clone());
+            routing_table.insert(neighbor.neighbor_ip.clone(), (next_hop.clone(), 1)); // Metric = 1
             println!("Updated route: {} -> next_hop: {}", neighbor.neighbor_ip, next_hop);
             
             if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
@@ -381,11 +441,39 @@ async fn update_routing_from_lsa(
     }
     
     // Mettre à jour les routes connues de la LSA
-    for (dest, _) in &lsa.known_routes {
-        if dest != &sender_ip && !local_ips.contains_key(&dest.parse::<IpAddr>().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))) {
-            routing_table.insert(dest.clone(), next_hop.clone());
-            println!("Updated route from LSA known_routes: {} -> next_hop: {}", dest, next_hop);
-            
+    for (dest, (next_hop_lsa, metric_lsa)) in &lsa.known_routes {
+        // Vérifier si la destination est une adresse locale
+        if let Ok(dest_ip) = dest.parse::<IpAddr>() {
+            if local_ips.contains_key(&dest_ip) {
+                log::debug!("Skipping route to local IP: {}", dest);
+                continue;
+            }
+        } else {
+            log::warn!("Invalid IP address: {}", dest);
+            continue;
+        }
+        
+        // Split horizon : ne pas annoncer la route par l'interface par laquelle on l'a apprise
+        if next_hop_lsa == receiving_interface_ip {
+            log::debug!("Skipping route due to split horizon: {} via {}", dest, next_hop_lsa);
+            continue;
+        }
+
+        // Calculer la métrique pour cette route (incrémenter la métrique reçue)
+        let new_metric = metric_lsa + 1;
+
+        // Mettre à jour la route si elle n'existe pas ou si la nouvelle métrique est meilleure
+        if let Some((_, current_metric)) = routing_table.get(dest) {
+            if new_metric < *current_metric {
+                routing_table.insert(dest.clone(), (next_hop.clone(), new_metric));
+                println!("Updated route from LSA known_routes: {} -> next_hop: {}, metric: {}", dest, next_hop, new_metric);
+                if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
+                    log::warn!("Could not update system routing table for {}: {}", dest, e);
+                }
+            }
+        } else {
+            routing_table.insert(dest.clone(), (next_hop.clone(), new_metric));
+            println!("Added route from LSA known_routes: {} -> next_hop: {}, metric: {}", dest, next_hop, new_metric);
             if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
                 log::warn!("Could not update system routing table for {}: {}", dest, e);
             }
