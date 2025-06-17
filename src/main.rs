@@ -341,6 +341,9 @@ fn get_local_ip() -> Result<String, Box<dyn std::error::Error>> {
     Err("No valid IP address found".into())
 }
 
+// Constante pour la métrique infinie (route poisoning)
+const INFINITE_METRIC: u32 = 16;
+
 async fn update_routing_from_lsa(
     state: Arc<AppState>,
     lsa: &LSAMessage,
@@ -369,13 +372,36 @@ async fn update_routing_from_lsa(
     
     // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
     for neighbor in &lsa.neighbors {
-        if neighbor.link_up && !routing_table.contains_key(&neighbor.neighbor_ip) {
-            routing_table.insert(neighbor.neighbor_ip.clone(), next_hop.clone());
-            println!("Updated route: {} -> next_hop: {}", neighbor.neighbor_ip, next_hop);
+        if neighbor.link_up {
+            if neighbor.neighbor_ip == sender_ip {
+                // Ne pas ajouter de route vers soi-même
+                continue;
+            }
             
-            // Mettre à jour la table de routage système avec gestion d'erreur
-            if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
-                log::warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
+            if routing_table.contains_key(&neighbor.neighbor_ip) {
+                // La route existe déjà, vérifier si le nouveau chemin est meilleur
+                let current_next_hop = routing_table.get(&neighbor.neighbor_ip).unwrap();
+                if current_next_hop != &next_hop {
+                    // Le nouveau chemin est différent, vérifier si la métrique est meilleure
+                    // (Pour l'instant, on n'a pas de métrique, donc on ne met pas à jour)
+                    println!("Route already exists, but new path is different: {}", neighbor.neighbor_ip);
+                }
+            } else {
+                // La route n'existe pas, l'ajouter
+                routing_table.insert(neighbor.neighbor_ip.clone(), next_hop.clone());
+                println!("Updated route: {} -> next_hop: {}", neighbor.neighbor_ip, next_hop);
+                
+                // Mettre à jour la table de routage système avec gestion d'erreur
+                if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
+                    log::warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
+                }
+            }
+        } else {
+            // Le voisin est inaccessible, empoisonner la route
+            if routing_table.contains_key(&neighbor.neighbor_ip) {
+                println!("Route poisoning: {} -> unreachable", neighbor.neighbor_ip);
+                routing_table.remove(&neighbor.neighbor_ip);
+                // (Il faudrait aussi annoncer cette route avec une métrique infinie)
             }
         }
     }
