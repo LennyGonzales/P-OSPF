@@ -80,6 +80,21 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), B
     Ok(())
 }
 
+// Ajout de la fonction get_local_ip
+fn get_local_ip() -> Result<String, Box<dyn std::error::Error>> {
+    let interfaces = datalink::interfaces();
+    for interface in interfaces {
+        for ip_network in interface.ips {
+            if let IpAddr::V4(ipv4) = ip_network.ip() {
+                if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                    return Ok(ipv4.to_string());
+                }
+            }
+        }
+    }
+    Err("No valid IP address found".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -183,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
 
                                 // Mettre à jour la table de routage en fonction des informations LSA
-                                if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string()).await {
+                                if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string(), &local_ips).await {
                                     log::error!("Failed to update routing from LSA: {}", e);
                                 }
 
@@ -330,7 +345,8 @@ async fn forward_lsa(
 async fn update_routing_from_lsa(
     state: Arc<AppState>,
     lsa: &LSAMessage,
-    sender_ip: &str
+    sender_ip: &str,
+    local_ips: &HashMap<IpAddr, String>
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut routing_table = state.routing_table.lock().await;
     
