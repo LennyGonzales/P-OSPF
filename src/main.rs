@@ -27,8 +27,16 @@ struct LSAMessage {
     router_ip: String,
     last_hop: Option<String>, // Le dernier routeur par lequel le message est passé
     originator: String,       // Le routeur qui émet originalement la LSA
+    sequence_number: u32,     // Numéro de séquence pour éviter les boucles
+    ttl: u8,                  // Time To Live pour limiter la propagation
     neighbor_count: usize,
     neighbors: Vec<Neighbor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LSAKey {
+    originator: String,
+    sequence_number: u32,
 }
 
 struct Router {
@@ -40,6 +48,8 @@ struct AppState {
     topology: Mutex<HashMap<String, Router>>,
     neighbors: Mutex<HashMap<String, Neighbor>>,
     routing_table: Mutex<HashMap<String, String>>, // destination -> next_hop
+    lsa_cache: Mutex<HashMap<LSAKey, std::time::Instant>>, // Cache des LSA déjà vues
+    sequence_number: Mutex<u32>, // Numéro de séquence pour les LSA émises par ce routeur
 }
 
 fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
@@ -78,6 +88,34 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), B
     Ok(())
 }
 
+// Fonction pour vérifier si une LSA a déjà été vue (évite les boucles)
+async fn is_lsa_already_seen(state: Arc<AppState>, lsa: &LSAMessage) -> bool {
+    let mut cache = state.lsa_cache.lock().await;
+    let key = LSAKey {
+        originator: lsa.originator.clone(),
+        sequence_number: lsa.sequence_number,
+    };
+    
+    // Nettoyer les entrées anciennes (plus de 30 secondes)
+    let now = std::time::Instant::now();
+    cache.retain(|_, timestamp| now.duration_since(*timestamp).as_secs() < 30);
+    
+    // Vérifier si cette LSA a déjà été vue
+    if cache.contains_key(&key) {
+        true
+    } else {
+        cache.insert(key, now);
+        false
+    }
+}
+
+// Fonction pour obtenir le prochain numéro de séquence
+async fn get_next_sequence_number(state: Arc<AppState>) -> u32 {
+    let mut seq = state.sequence_number.lock().await;
+    *seq += 1;
+    *seq
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -92,6 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         topology: Mutex::new(HashMap::new()),
         neighbors: Mutex::new(HashMap::new()),
         routing_table: Mutex::new(HashMap::new()),
+        lsa_cache: Mutex::new(HashMap::new()),
+        sequence_number: Mutex::new(0),
     });
 
     let socket_clone = Arc::clone(&socket);
@@ -104,6 +144,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = send_hello(&socket_clone, addr, local_ip).await {
                     log::error!("Failed to send hello to {}: {}", addr, e);
                 }
+            }
+        }
+    });
+
+    // Tâche de nettoyage du cache LSA
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await; // Nettoyer toutes les minutes
+            let mut cache = state_clone.lsa_cache.lock().await;
+            let now = std::time::Instant::now();
+            let initial_size = cache.len();
+            cache.retain(|_, timestamp| now.duration_since(*timestamp).as_secs() < 120); // Garder pendant 2 minutes
+            let final_size = cache.len();
+            if initial_size != final_size {
+                println!("LSA cache cleanup: {} -> {} entries", initial_size, final_size);
             }
         }
     });
@@ -172,8 +228,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                println!("[RECV] LSA from {} (originator: {}, last_hop: {:?}) on interface {}", 
-                                    src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
+                                println!("[RECV] LSA from {} (originator: {}, seq: {}, ttl: {}, last_hop: {:?}) on interface {}", 
+                                    src_addr, lsa.originator, lsa.sequence_number, lsa.ttl, lsa.last_hop, receiving_interface_ip);
+                                
+                                // Vérifier le TTL
+                                if lsa.ttl == 0 {
+                                    println!("LSA TTL expired, dropping message");
+                                    continue;
+                                }
+                                
+                                // Vérifier si cette LSA a déjà été vue (évite les boucles)
+                                if is_lsa_already_seen(Arc::clone(&state), &lsa).await {
+                                    println!("LSA already seen (originator: {}, seq: {}), dropping to avoid loop", 
+                                        lsa.originator, lsa.sequence_number);
+                                    continue;
+                                }
                                 
                                 // Mettre à jour la table de routage en fonction des informations LSA
                                 if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string()).await {
@@ -184,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     log::error!("Failed to update topology: {}", e);
                                 }
 
+                                // Retransmettre seulement si ce n'est pas notre propre LSA
                                 if lsa.originator != receiving_interface_ip {
                                     let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
                                     if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, Arc::clone(&state)).await {
@@ -292,18 +362,24 @@ async fn send_lsa(
     }
     drop(topology);
 
+    // Obtenir le numéro de séquence
+    let sequence_number = get_next_sequence_number(Arc::clone(&state)).await;
+
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
         last_hop: last_hop.map(|s| s.to_string()),
         originator: originator.to_string(),
+        sequence_number,
+        ttl: 10, // TTL initial de 10
         neighbor_count: all_neighbors.len(),
         neighbors: all_neighbors,
     };
 
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[SEND] LSA from {} (originator: {}, last_hop: {:?}) to {}", router_ip, originator, last_hop, addr);
+    println!("[SEND] LSA from {} (originator: {}, seq: {}, ttl: {}, last_hop: {:?}) to {}", 
+        router_ip, originator, sequence_number, 10, last_hop, addr);
     Ok(())
 }
 
@@ -314,18 +390,30 @@ async fn forward_lsa(
     original_lsa: &LSAMessage,
     state: Arc<AppState>
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Décrémenter le TTL
+    let new_ttl = original_lsa.ttl.saturating_sub(1);
+    
+    // Ne pas retransmettre si le TTL est à 0
+    if new_ttl == 0 {
+        println!("TTL reached 0, not forwarding LSA from originator {}", original_lsa.originator);
+        return Ok(());
+    }
+
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
         last_hop: Some(router_ip.to_string()),
         originator: original_lsa.originator.clone(),
+        sequence_number: original_lsa.sequence_number,
+        ttl: new_ttl,
         neighbor_count: original_lsa.neighbor_count,
         neighbors: original_lsa.neighbors.clone(),
     };
 
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[FORWARD] LSA from {} (originator: {}) to {}", router_ip, original_lsa.originator, addr);
+    println!("[FORWARD] LSA from {} (originator: {}, seq: {}, ttl: {}) to {}", 
+        router_ip, original_lsa.originator, original_lsa.sequence_number, new_ttl, addr);
     Ok(())
 }
 
