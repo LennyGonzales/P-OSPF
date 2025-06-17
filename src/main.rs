@@ -61,9 +61,6 @@ fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let router_ip = get_local_ip()?;
-    println!("Router IP: {}", router_ip);
-
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:5000").await?);
     socket.set_broadcast(true)?;
 
@@ -116,10 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
                     match message_type {
                         1 => {
-                            println!("IN [RECV] HELLO");
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
                                 println!("[RECV] HELLO from {} - {}", hello.router_ip, src_addr);
-                                
+
                                 let mut neighbors = state.neighbors.lock().await;
                                 neighbors.insert(
                                     hello.router_ip.clone(),
@@ -131,20 +127,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 drop(neighbors);
 
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &router_ip, state.clone()).await {
-                                    log::error!("Failed to send LSA: {}", e);
+                                // Get the local address of the interface that received the Hello message
+                                if let Ok(local_addr) = socket.local_addr() {
+                                    let local_ip_str = match local_addr.ip() {
+                                        std::net::IpAddr::V4(ipv4) => ipv4.to_string(),
+                                        std::net::IpAddr::V6(ipv6) => ipv6.to_string(),
+                                    };
+                                    // Create a new socket bound to the same interface (local address)
+                                    if let Ok(interface_socket) = UdpSocket::bind(local_addr).await {
+                                        if let Err(e) = send_lsa(&interface_socket, &broadcast_addr, &local_ip_str, state.clone()).await {
+                                            log::error!("Failed to send LSA: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
                                 println!("[RECV] LSA from {} - {}", lsa.router_ip, src_addr);
+
                                 if let Err(e) = update_topology(state.clone(), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                // Correction : toujours calculer la table de routage depuis l'IP locale
-                                if let Err(e) = compute_shortest_paths(state.clone(), &router_ip).await {
-                                    log::error!("Failed to compute shortest paths: {}", e);
+
+                                // Utilise l'IP locale de l'interface pour le calcul des chemins
+                                if let Ok(local_addr) = socket.local_addr() {
+                                    let local_ip_str = match local_addr.ip() {
+                                        std::net::IpAddr::V4(ipv4) => ipv4.to_string(),
+                                        std::net::IpAddr::V6(ipv6) => ipv6.to_string(),
+                                    };
+                                    if let Err(e) = compute_shortest_paths(state.clone(), &local_ip_str).await {
+                                        log::error!("Failed to compute shortest paths: {}", e);
+                                    }
                                 }
                             }
                         }
