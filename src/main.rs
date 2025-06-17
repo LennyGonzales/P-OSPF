@@ -183,6 +183,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
+
+                                if lsa.originator != receiving_interface_ip {
+                                    let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
+                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, Arc::clone(&state)).await {
+                                        log::error!("Failed to forward LSA: {}", e);
+                                    }
+                                }
                             }
                         }
                         _ => log::warn!("Unknown message type: {}", message_type),
