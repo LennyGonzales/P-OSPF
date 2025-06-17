@@ -1,11 +1,12 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use net_route::{Route, Handle};
 use pnet::datalink::{self, NetworkInterface};
+use log;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HelloMessage {
@@ -48,16 +49,33 @@ fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
         .flat_map(|iface: NetworkInterface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ip) = ip_network.ip() {
-                    let prefix_len = ip_network.prefix();
-                    let mask = u32::MAX << (32 - prefix_len);
-                    let broadcast = u32::from(ip) | !mask;
-                    Some((ip.to_string(), SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port)))
+                    if !ip.is_loopback() { // Exclude loopback addresses
+                        let prefix_len = ip_network.prefix();
+                        let mask = u32::MAX << (32 - prefix_len);
+                        let broadcast = u32::from(ip) | !mask;
+                        Some((ip.to_string(), SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port)))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             })
         })
         .collect()
+}
+
+// Ajout de la fonction update_topology
+async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), Box<dyn std::error::Error>> {
+    let mut topology = state.topology.lock().await;
+    topology.insert(
+        lsa.originator.clone(),
+        Router {
+            router_ip: lsa.originator.clone(),
+            neighbors: lsa.neighbors.clone(),
+        },
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -98,7 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|iface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ipv4) = ip_network.ip() {
-                    Some((IpAddr::V4(ipv4), ipv4.to_string()))
+                    if !ipv4.is_loopback() { // Exclude loopback addresses
+                        Some((IpAddr::V4(ipv4), ipv4.to_string()))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -124,7 +146,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
                     match message_type {
                         1 => {
-                            println!("IN [RECV] HELLO");
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
                                 println!("[RECV] HELLO from {} - {} (received on interface {})", 
                                     hello.router_ip, src_addr, receiving_interface_ip);
@@ -144,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
                                 
                                 // Envoyer la LSA avec l'IP de l'interface qui a reçu le HELLO
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, None, &receiving_interface_ip, state.clone()).await {
+                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, None, &receiving_interface_ip, Arc::clone(&state)).await {
                                     log::error!("Failed to send LSA: {}", e);
                                 }
                             }
@@ -155,18 +176,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
                                 
                                 // Mettre à jour la table de routage en fonction des informations LSA
-                                if let Err(e) = update_routing_from_lsa(state.clone(), &lsa, &src_addr.ip().to_string()).await {
+                                if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string()).await {
                                     log::error!("Failed to update routing from LSA: {}", e);
                                 }
                                 
-                                if let Err(e) = update_topology(state.clone(), &lsa).await {
+                                if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
                                 
                                 // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
                                 if lsa.originator != receiving_interface_ip {
                                     let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
-                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, state.clone()).await {
+                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, Arc::clone(&state)).await {
                                         log::error!("Failed to forward LSA: {}", e);
                                     }
                                 }
@@ -340,9 +361,9 @@ async fn update_routing_from_lsa(
         routing_table.insert(lsa.originator.clone(), next_hop.clone());
         println!("Updated route: {} -> next_hop: {}", lsa.originator, next_hop);
         
-        // Mettre à jour la table de routage système
-        if let Err(e) = update_routing_table(&lsa.originator, &next_hop).await {
-            log::error!("Failed to update system routing table: {}", e);
+        // Mettre à jour la table de routage système avec gestion d'erreur
+        if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
+            log::warn!("Could not update system routing table for {}: {}", lsa.originator, e);
         }
     }
     
@@ -352,9 +373,9 @@ async fn update_routing_from_lsa(
             routing_table.insert(neighbor.neighbor_ip.clone(), next_hop.clone());
             println!("Updated route: {} -> next_hop: {}", neighbor.neighbor_ip, next_hop);
             
-            // Mettre à jour la table de routage système
-            if let Err(e) = update_routing_table(&neighbor.neighbor_ip, &next_hop).await {
-                log::error!("Failed to update system routing table: {}", e);
+            // Mettre à jour la table de routage système avec gestion d'erreur
+            if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
+                log::warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
             }
         }
     }
@@ -362,59 +383,71 @@ async fn update_routing_from_lsa(
     Ok(())
 }
 
-async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), Box<dyn std::error::Error>> {
-    let mut topology = state.topology.lock().await;
-    topology.insert(
-        lsa.originator.clone(),
-        Router {
-            router_ip: lsa.originator.clone(),
-            neighbors: lsa.neighbors.clone(),
-        },
-    );
-    Ok(())
-}
-
-async fn compute_shortest_paths(state: Arc<AppState>, source_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let topology = state.topology.lock().await;
-    let routing_table = state.routing_table.lock().await;
+// Version sécurisée de update_routing_table avec meilleure gestion d'erreur
+async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Valider les adresses IP
+    let destination_ip: Ipv4Addr = match destination.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            log::warn!("Invalid destination IP {}: {}", destination, e);
+            return Err(format!("Invalid destination IP: {}", e).into());
+        }
+    };
     
-    println!("\n=== Current Routing Table ({}) ===", source_ip);
-    for (destination, next_hop) in routing_table.iter() {
-        println!("To {} via {}", destination, next_hop);
-    }
-    println!("==================================\n");
-    
-    Ok(())
-}
-
-async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let destination_ip: Ipv4Addr = destination.parse()?;
-    let gateway_ip: Ipv4Addr = gateway.parse()?;
-
-    let handle = Handle::new()?;
-    
-    // Calculer l'adresse réseau en appliquant un masque /24 (255.255.255.0)
-    let network_addr = Ipv4Addr::from(u32::from(destination_ip) & 0xFFFFFF00);
-
-    // Vérifie si la destination et la gateway sont sur le même réseau
-    let is_direct = (u32::from(destination_ip) & 0xFFFFFF00) == (u32::from(gateway_ip) & 0xFFFFFF00);
-
-    let route = if is_direct {
-        Route::new(IpAddr::V4(network_addr), 24)
-    } else {
-        Route::new(IpAddr::V4(network_addr), 24)
-            .with_gateway(IpAddr::V4(gateway_ip))
+    let gateway_ip: Ipv4Addr = match gateway.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            log::warn!("Invalid gateway IP {}: {}", gateway, e);
+            return Err(format!("Invalid gateway IP: {}", e).into());
+        }
     };
 
-    match handle.add(&route).await {
-        Ok(_) => println!("Successfully added route to network {}/24 via {}", network_addr, gateway),
-        Err(e) => {
-            log::warn!("Failed to add route to network {}/24 via {}: {}", network_addr, gateway, e);
-            let _ = handle.delete(&route).await;
-            handle.add(&route).await?;
-            println!("Successfully updated route to network {}/24 via {}", network_addr, gateway);
-        }
+    // Éviter d'ajouter des routes vers des adresses locales ou invalides
+    if destination_ip.is_loopback() || destination_ip.is_unspecified() || 
+       gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
+        log::debug!("Skipping route to invalid address: {} via {}", destination, gateway);
+        return Ok(());
     }
 
-    Ok(())
+    // Vérifier si on a les permissions pour modifier la table de routage
+    let handle = match Handle::new() {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("Cannot create routing handle (permissions?): {}", e);
+            return Err(format!("Routing permissions error: {}", e).into());
+        }
+    };
+    
+    // Calculer l'adresse réseau en appliquant un masque /32 pour une route host spécifique
+    let route = Route::new(IpAddr::V4(destination_ip), 32)
+        .with_gateway(IpAddr::V4(gateway_ip));
+
+    // Essayer d'ajouter la route
+    match handle.add(&route).await {
+        Ok(_) => {
+            println!("Successfully added host route to {} via {}", destination_ip, gateway_ip);
+            Ok(())
+        },
+        Err(e) => {
+            // Si la route existe déjà, essayer de la supprimer puis la re-ajouter
+            log::debug!("Route add failed, trying to update: {}", e);
+            let _ = handle.delete(&route).await; // Ignorer l'erreur de suppression
+            
+            match handle.add(&route).await {
+                Ok(_) => {
+                    println!("Successfully updated host route to {} via {}", destination_ip, gateway_ip);
+                    Ok(())
+                },
+                Err(e2) => {
+                    log::warn!("Failed to add/update route to {} via {}: {}", destination_ip, gateway_ip, e2);
+                    Err(format!("Routing update failed: {}", e2).into())
+                }
+            }
+        }
+    }
+}
+
+// Fonction originale renommée pour compatibilité
+async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
+    update_routing_table_safe(destination, gateway).await
 }
