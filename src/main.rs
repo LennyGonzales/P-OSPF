@@ -183,8 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                
-                                // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
+
                                 if lsa.originator != receiving_interface_ip {
                                     let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
                                     if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, Arc::clone(&state)).await {
@@ -268,16 +267,38 @@ async fn send_lsa(
     originator: &str,
     state: Arc<AppState>
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Récupérer tous les voisins connus dans la topologie
+    let mut all_neighbors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    
+    // Ajouter d'abord les voisins directs
     let neighbors = state.neighbors.lock().await;
-    let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
+    for neighbor in neighbors.values() {
+        if seen.insert(neighbor.neighbor_ip.clone()) {
+            all_neighbors.push(neighbor.clone());
+        }
+    }
+    drop(neighbors);
+    
+    // Ensuite ajouter tous les voisins connus de la topologie
+    let topology = state.topology.lock().await;
+    for router in topology.values() {
+        for neighbor in &router.neighbors {
+            // On évite les doublons (par IP) et on évite d'ajouter le routeur lui-même
+            if neighbor.neighbor_ip != router_ip && seen.insert(neighbor.neighbor_ip.clone()) {
+                all_neighbors.push(neighbor.clone());
+            }
+        }
+    }
+    drop(topology);
 
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
         last_hop: last_hop.map(|s| s.to_string()),
         originator: originator.to_string(),
-        neighbor_count: neighbors_vec.len(),
-        neighbors: neighbors_vec,
+        neighbor_count: all_neighbors.len(),
+        neighbors: all_neighbors,
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -445,9 +466,4 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
             }
         }
     }
-}
-
-// Fonction originale renommée pour compatibilité
-async fn update_routing_table(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
-    update_routing_table_safe(destination, gateway).await
 }
