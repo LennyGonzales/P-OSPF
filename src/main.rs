@@ -268,9 +268,20 @@ async fn send_lsa(
     state: Arc<AppState>
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Récupérer tous les voisins connus dans la topologie
-    let topology = state.topology.lock().await;
     let mut all_neighbors = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    
+    // Ajouter d'abord les voisins directs
+    let neighbors = state.neighbors.lock().await;
+    for neighbor in neighbors.values() {
+        if seen.insert(neighbor.neighbor_ip.clone()) {
+            all_neighbors.push(neighbor.clone());
+        }
+    }
+    drop(neighbors);
+    
+    // Ensuite ajouter tous les voisins connus de la topologie
+    let topology = state.topology.lock().await;
     for router in topology.values() {
         for neighbor in &router.neighbors {
             // On évite les doublons (par IP)
