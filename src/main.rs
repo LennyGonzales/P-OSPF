@@ -21,6 +21,7 @@ struct Neighbor {
     capacity: u32,
 }
 
+// Modifie la structure LSAMessage pour inclure toutes les routes connues
 #[derive(Debug, Serialize, Deserialize)]
 struct LSAMessage {
     message_type: u8,
@@ -29,6 +30,7 @@ struct LSAMessage {
     originator: String,       // Le routeur qui émet originalement la LSA
     neighbor_count: usize,
     neighbors: Vec<Neighbor>,
+    known_routes: HashMap<String, String>, // destination -> next_hop
 }
 
 struct Router {
@@ -95,9 +97,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let socket_clone = Arc::clone(&socket);
+    let state_clone = Arc::clone(&state);
+
+    // Fréquence d'envoi des HELLO et LSA (plus fréquente)
+    let hello_interval = tokio::time::Duration::from_secs(10);
+
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+            tokio::time::sleep(hello_interval).await;
             let broadcast_addrs = get_broadcast_addresses_with_local(5000);
 
             for (local_ip, addr) in &broadcast_addrs {
@@ -116,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|iface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ipv4) = ip_network.ip() {
-                    if !ipv4.is_loopback() { // Exclude loopback addresses
+                    if !ipv4.is_loopback() {
                         Some((IpAddr::V4(ipv4), ipv4.to_string()))
                     } else {
                         None
@@ -130,12 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
-        
+
         // Ignore les paquets venant d'une IP locale
         if local_ips.contains_key(&src_addr.ip()) {
             continue;
         }
-        
+
         println!("Received {} bytes from {}", len, src_addr);
 
         // Déterminer l'IP locale de l'interface qui a reçu le paquet
@@ -147,9 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match message_type {
                         1 => {
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
-                                println!("[RECV] HELLO from {} - {} (received on interface {})", 
+                                println!("[RECV] HELLO from {} - {} (received on interface {})",
                                     hello.router_ip, src_addr, receiving_interface_ip);
-                                
+
                                 let mut neighbors = state.neighbors.lock().await;
                                 neighbors.insert(
                                     hello.router_ip.clone(),
@@ -163,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Calculer l'adresse de broadcast pour l'interface qui a reçu le HELLO
                                 let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
-                                
+
                                 // Envoyer la LSA avec l'IP de l'interface qui a reçu le HELLO
                                 if let Err(e) = send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, None, &receiving_interface_ip, Arc::clone(&state)).await {
                                     log::error!("Failed to send LSA: {}", e);
@@ -172,18 +179,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                println!("[RECV] LSA from {} (originator: {}, last_hop: {:?}) on interface {}", 
+                                println!("[RECV] LSA from {} (originator: {}, last_hop: {:?}) on interface {}",
                                     src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
-                                
+
                                 // Mettre à jour la table de routage en fonction des informations LSA
                                 if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string()).await {
                                     log::error!("Failed to update routing from LSA: {}", e);
                                 }
-                                
+
                                 if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
                                     log::error!("Failed to update topology: {}", e);
                                 }
-                                
+
                                 // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
                                 if lsa.originator != receiving_interface_ip {
                                     let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
@@ -270,6 +277,10 @@ async fn send_lsa(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let neighbors = state.neighbors.lock().await;
     let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
+    
+    // Inclure toutes les routes connues
+    let routing_table = state.routing_table.lock().await;
+    let known_routes = routing_table.clone();
 
     let message = LSAMessage {
         message_type: 2,
@@ -278,6 +289,7 @@ async fn send_lsa(
         originator: originator.to_string(),
         neighbor_count: neighbors_vec.len(),
         neighbors: neighbors_vec,
+        known_routes: known_routes,
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -286,6 +298,7 @@ async fn send_lsa(
     Ok(())
 }
 
+// Modifier également forward_lsa pour inclure les routes
 async fn forward_lsa(
     socket: &UdpSocket,
     addr: &SocketAddr,
@@ -293,6 +306,10 @@ async fn forward_lsa(
     original_lsa: &LSAMessage,
     state: Arc<AppState>
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Inclure les routes connues
+    let routing_table = state.routing_table.lock().await;
+    let known_routes = routing_table.clone();
+
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
@@ -300,6 +317,7 @@ async fn forward_lsa(
         originator: original_lsa.originator.clone(),
         neighbor_count: original_lsa.neighbor_count,
         neighbors: original_lsa.neighbors.clone(),
+        known_routes: original_lsa.known_routes.clone(), // Propager les routes du LSA original
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -308,39 +326,7 @@ async fn forward_lsa(
     Ok(())
 }
 
-fn get_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
-    let interfaces = datalink::interfaces();
-    interfaces
-        .into_iter()
-        .flat_map(|iface: NetworkInterface| {
-            iface.ips.into_iter().filter_map(move |ip_network| {
-                if let IpAddr::V4(ip) = ip_network.ip() {
-                    let prefix_len = ip_network.prefix();
-                    let mask = u32::MAX << (32 - prefix_len);
-                    let broadcast = u32::from(ip) | !mask;
-                    Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(broadcast)), port))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect()
-}
-
-fn get_local_ip() -> Result<String, Box<dyn std::error::Error>> {
-    let interfaces = datalink::interfaces();
-    for interface in interfaces {
-        for ip_network in interface.ips {
-            if let IpAddr::V4(ipv4) = ip_network.ip() {
-                if !ipv4.is_loopback() && !ipv4.is_unspecified() {
-                    return Ok(ipv4.to_string());
-                }
-            }
-        }
-    }
-    Err("No valid IP address found".into())
-}
-
+// Mettre à jour update_routing_from_lsa pour utiliser les routes connues
 async fn update_routing_from_lsa(
     state: Arc<AppState>,
     lsa: &LSAMessage,
@@ -361,7 +347,6 @@ async fn update_routing_from_lsa(
         routing_table.insert(lsa.originator.clone(), next_hop.clone());
         println!("Updated route: {} -> next_hop: {}", lsa.originator, next_hop);
         
-        // Mettre à jour la table de routage système avec gestion d'erreur
         if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
             log::warn!("Could not update system routing table for {}: {}", lsa.originator, e);
         }
@@ -369,13 +354,24 @@ async fn update_routing_from_lsa(
     
     // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
     for neighbor in &lsa.neighbors {
-        if neighbor.link_up && !routing_table.contains_key(&neighbor.neighbor_ip) {
+        if neighbor.link_up && neighbor.neighbor_ip != sender_ip {
             routing_table.insert(neighbor.neighbor_ip.clone(), next_hop.clone());
             println!("Updated route: {} -> next_hop: {}", neighbor.neighbor_ip, next_hop);
             
-            // Mettre à jour la table de routage système avec gestion d'erreur
             if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
                 log::warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
+            }
+        }
+    }
+    
+    // Mettre à jour les routes connues de la LSA
+    for (dest, _) in &lsa.known_routes {
+        if dest != &sender_ip && !local_ips.contains_key(&dest.parse::<IpAddr>().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))) {
+            routing_table.insert(dest.clone(), next_hop.clone());
+            println!("Updated route from LSA known_routes: {} -> next_hop: {}", dest, next_hop);
+            
+            if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
+                log::warn!("Could not update system routing table for {}: {}", dest, e);
             }
         }
     }
