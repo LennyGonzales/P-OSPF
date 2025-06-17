@@ -70,8 +70,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:5000").await?);
     socket.set_broadcast(true)?;
 
-    let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 5000);
-
     let state = Arc::new(AppState {
         topology: Mutex::new(HashMap::new()),
         neighbors: Mutex::new(HashMap::new()),
@@ -79,7 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let socket_clone = Arc::clone(&socket);
-    let router_ip_clone = router_ip.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
@@ -95,26 +92,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut buf = [0; 2048];
 
-    // Récupère toutes les IP locales (IPv4)
-    let local_ips: Vec<IpAddr> = datalink::interfaces()
+    // Récupère toutes les IP locales (IPv4) avec leurs interfaces
+    let local_ips: HashMap<IpAddr, String> = datalink::interfaces()
         .into_iter()
-        .flat_map(|iface| iface.ips)
-        .filter_map(|ip_network| {
-            if let IpAddr::V4(ipv4) = ip_network.ip() {
-                Some(IpAddr::V4(ipv4))
-            } else {
-                None
-            }
+        .flat_map(|iface| {
+            iface.ips.into_iter().filter_map(move |ip_network| {
+                if let IpAddr::V4(ipv4) = ip_network.ip() {
+                    Some((IpAddr::V4(ipv4), ipv4.to_string()))
+                } else {
+                    None
+                }
+            })
         })
         .collect();
 
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
+        
         // Ignore les paquets venant d'une IP locale
-        if local_ips.contains(&src_addr.ip()) {
+        if local_ips.contains_key(&src_addr.ip()) {
             continue;
         }
+        
         println!("Received {} bytes from {}", len, src_addr);
+
+        // Déterminer l'IP locale de l'interface qui a reçu le paquet
+        let receiving_interface_ip = determine_receiving_interface(&src_addr.ip(), &local_ips)?;
 
         match serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
             Ok(json) => {
@@ -123,7 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         1 => {
                             println!("IN [RECV] HELLO");
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
-                                println!("[RECV] HELLO from {} - {}", hello.router_ip, src_addr);
+                                println!("[RECV] HELLO from {} - {} (received on interface {})", 
+                                    hello.router_ip, src_addr, receiving_interface_ip);
                                 
                                 let mut neighbors = state.neighbors.lock().await;
                                 neighbors.insert(
@@ -136,15 +140,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 drop(neighbors);
 
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &router_ip, None, &router_ip, state.clone()).await {
+                                // Calculer l'adresse de broadcast pour l'interface qui a reçu le HELLO
+                                let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
+                                
+                                // Envoyer la LSA avec l'IP de l'interface qui a reçu le HELLO
+                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, None, &receiving_interface_ip, state.clone()).await {
                                     log::error!("Failed to send LSA: {}", e);
                                 }
                             }
                         }
                         2 => {
                             if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                println!("[RECV] LSA from {} (originator: {}, last_hop: {:?})", 
-                                    src_addr, lsa.originator, lsa.last_hop);
+                                println!("[RECV] LSA from {} (originator: {}, last_hop: {:?}) on interface {}", 
+                                    src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
                                 
                                 // Mettre à jour la table de routage en fonction des informations LSA
                                 if let Err(e) = update_routing_from_lsa(state.clone(), &lsa, &src_addr.ip().to_string()).await {
@@ -156,8 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 
                                 // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
-                                if lsa.originator != router_ip {
-                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &router_ip, &lsa, state.clone()).await {
+                                if lsa.originator != receiving_interface_ip {
+                                    let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
+                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, state.clone()).await {
                                         log::error!("Failed to forward LSA: {}", e);
                                     }
                                 }
@@ -174,6 +183,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+// Fonction pour déterminer l'IP de l'interface qui a reçu le paquet
+fn determine_receiving_interface(sender_ip: &IpAddr, local_ips: &HashMap<IpAddr, String>) -> Result<String, Box<dyn std::error::Error>> {
+    if let IpAddr::V4(sender_ipv4) = sender_ip {
+        let sender_u32 = u32::from(*sender_ipv4);
+        
+        // Chercher l'interface locale qui est sur le même réseau que l'expéditeur
+        for (local_ip, local_ip_str) in local_ips {
+            if let IpAddr::V4(local_ipv4) = local_ip {
+                let local_u32 = u32::from(*local_ipv4);
+                
+                // Vérifier si ils sont sur le même réseau /24
+                if (sender_u32 & 0xFFFFFF00) == (local_u32 & 0xFFFFFF00) {
+                    return Ok(local_ip_str.clone());
+                }
+            }
+        }
+    }
+    
+    // Si aucune interface correspondante n'est trouvée, utiliser la première IP locale non-loopback
+    for (local_ip, local_ip_str) in local_ips {
+        if let IpAddr::V4(ipv4) = local_ip {
+            if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                return Ok(local_ip_str.clone());
+            }
+        }
+    }
+    
+    Err("No valid receiving interface found".into())
+}
+
+// Fonction pour calculer l'adresse de broadcast pour une interface donnée
+fn calculate_broadcast_for_interface(interface_ip: &str, port: u16) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let ip: Ipv4Addr = interface_ip.parse()?;
+    let ip_u32 = u32::from(ip);
+    
+    // Supposer un masque /24 (255.255.255.0)
+    let mask = 0xFFFFFF00;
+    let broadcast_u32 = ip_u32 | !mask;
+    let broadcast_ip = Ipv4Addr::from(broadcast_u32);
+    
+    Ok(SocketAddr::new(IpAddr::V4(broadcast_ip), port))
 }
 
 async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -209,7 +261,7 @@ async fn send_lsa(
 
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[SEND] LSA from {} (originator: {}, last_hop: {:?})", router_ip, originator, last_hop);
+    println!("[SEND] LSA from {} (originator: {}, last_hop: {:?}) to {}", router_ip, originator, last_hop, addr);
     Ok(())
 }
 
@@ -231,7 +283,7 @@ async fn forward_lsa(
 
     let serialized = serde_json::to_vec(&message)?;
     socket.send_to(&serialized, addr).await?;
-    println!("[FORWARD] LSA from {} (originator: {})", router_ip, original_lsa.originator);
+    println!("[FORWARD] LSA from {} (originator: {}) to {}", router_ip, original_lsa.originator, addr);
     Ok(())
 }
 
