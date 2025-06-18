@@ -21,7 +21,7 @@ struct Neighbor {
     capacity: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct LSAMessage {
     message_type: u8,
     router_ip: String,
@@ -29,6 +29,8 @@ struct LSAMessage {
     originator: String,       // Le routeur qui émet originalement la LSA
     neighbor_count: usize,
     neighbors: Vec<Neighbor>,
+    routing_table: HashMap<String, String>, // Ajout de la table de routage
+    ttl: u8, // Time to live pour éviter les boucles infinies
 }
 
 struct Router {
@@ -38,8 +40,8 @@ struct Router {
 
 struct AppState {
     topology: Mutex<HashMap<String, Router>>,
-    neighbors: Mutex<HashMap<String, Neighbor>>,
-    routing_table: Mutex<HashMap<String, String>>, // destination -> next_hop
+    neighbors: Mutex::new(HashMap::new()),
+    routing_table: Mutex::new(HashMap::new()), // destination -> next_hop
 }
 
 fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
@@ -175,21 +177,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("[RECV] LSA from {} (originator: {}, last_hop: {:?}) on interface {}", 
                                     src_addr, lsa.originator, lsa.last_hop, receiving_interface_ip);
                                 
-                                // Mettre à jour la table de routage en fonction des informations LSA
-                                if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string()).await {
-                                    log::error!("Failed to update routing from LSA: {}", e);
-                                }
-                                
-                                if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
-                                    log::error!("Failed to update topology: {}", e);
-                                }
-                                
-                                // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
-                                if lsa.originator != receiving_interface_ip {
-                                    let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
-                                    if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, Arc::clone(&state)).await {
-                                        log::error!("Failed to forward LSA: {}", e);
+                                // Check TTL to prevent infinite loops
+                                if lsa.ttl > 0 {
+                                    // Mettre à jour la table de routage en fonction des informations LSA
+                                    if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, &src_addr.ip().to_string()).await {
+                                        log::error!("Failed to update routing from LSA: {}", e);
                                     }
+                                    
+                                    if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
+                                        log::error!("Failed to update topology: {}", e);
+                                    }
+                                    
+                                    // Retransmettre la LSA avec nous comme last_hop si ce n'est pas notre LSA
+                                    if lsa.originator != receiving_interface_ip {
+                                        let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, 5000)?;
+                                        if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, &lsa, Arc::clone(&state)).await {
+                                            log::error!("Failed to forward LSA: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    log::warn!("LSA TTL expired, not forwarding");
                                 }
                             }
                         }
@@ -270,6 +277,11 @@ async fn send_lsa(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let neighbors = state.neighbors.lock().await;
     let neighbors_vec = neighbors.values().cloned().collect::<Vec<_>>();
+    drop(neighbors);
+
+    let routing_table = state.routing_table.lock().await;
+    let routing_table_clone = routing_table.clone();
+    drop(routing_table);
 
     let message = LSAMessage {
         message_type: 2,
@@ -278,6 +290,8 @@ async fn send_lsa(
         originator: originator.to_string(),
         neighbor_count: neighbors_vec.len(),
         neighbors: neighbors_vec,
+        routing_table: routing_table_clone,
+        ttl: 64, // Initial TTL value
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -300,6 +314,8 @@ async fn forward_lsa(
         originator: original_lsa.originator.clone(),
         neighbor_count: original_lsa.neighbor_count,
         neighbors: original_lsa.neighbors.clone(),
+        routing_table: original_lsa.routing_table.clone(),
+        ttl: original_lsa.ttl - 1, // Decrement TTL
     };
 
     let serialized = serde_json::to_vec(&message)?;
@@ -402,6 +418,17 @@ async fn update_routing_from_lsa(
                 println!("Route poisoning: {} -> unreachable", neighbor.neighbor_ip);
                 routing_table.remove(&neighbor.neighbor_ip);
                 // (Il faudrait aussi annoncer cette route avec une métrique infinie)
+            }
+        }
+    }
+
+    // Process routing table from the LSA
+    for (dest, next_hop) in &lsa.routing_table {
+        if !routing_table.contains_key(dest) {
+            routing_table.insert(dest.clone(), next_hop.clone());
+            println!("Learned route from LSA: {} -> next_hop: {}", dest, next_hop);
+             if let Err(e) = update_routing_table_safe(&dest, &next_hop).await {
+                log::warn!("Could not update system routing table for {}: {}", dest, e);
             }
         }
     }
