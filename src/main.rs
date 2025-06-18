@@ -371,12 +371,15 @@ async fn update_routing_from_lsa(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut routing_table = state.routing_table.lock().await;
 
+    // Définir next_hop pour cette LSA
+    let next_hop = sender_ip.to_string();
+
     // Correction : éviter d'ajouter une route vers soi-même
     if lsa.originator != sender_ip && lsa.originator != *routing_table.get(&lsa.originator).unwrap_or(&"".to_string()) {
-        routing_table.insert(lsa.originator.clone(), sender_ip.to_string());
-        println!("Updated route: {} -> next_hop: {}", lsa.originator, sender_ip);
+        routing_table.insert(lsa.originator.clone(), next_hop.clone());
+        println!("Updated route: {} -> next_hop: {}", lsa.originator, next_hop);
 
-        if let Err(e) = update_routing_table_safe(&lsa.originator, sender_ip).await {
+        if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
             log::warn!("Could not update system routing table for {}: {}", lsa.originator, e);
         }
     }
