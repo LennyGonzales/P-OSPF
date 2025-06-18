@@ -40,8 +40,8 @@ struct Router {
 
 struct AppState {
     topology: Mutex<HashMap<String, Router>>,
-    neighbors: Mutex::new(HashMap::new()),
-    routing_table: Mutex::new(HashMap::new()), // destination -> next_hop
+    neighbors: Mutex<HashMap<String, Neighbor>>, // Correction ici : Mutex<HashMap<...>>
+    routing_table: Mutex<HashMap<String, String>>, // Correction ici : Mutex<HashMap<...>>
 }
 
 fn get_broadcast_addresses_with_local(port: u16) -> Vec<(String, SocketAddr)> {
@@ -92,8 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         topology: Mutex::new(HashMap::new()),
-        neighbors: Mutex::new(HashMap::new()),
-        routing_table: Mutex::new(HashMap::new()),
+        neighbors: Mutex::new(HashMap::new()), // Correction ici
+        routing_table: Mutex::new(HashMap::new()), // Correction ici
     });
 
     let socket_clone = Arc::clone(&socket);
@@ -305,8 +305,12 @@ async fn forward_lsa(
     addr: &SocketAddr,
     router_ip: &str,
     original_lsa: &LSAMessage,
-    state: Arc<AppState>
+    _state: Arc<AppState> // <- tu n'utilises pas state ici, donc tu peux le préfixer par _ pour éviter un warning
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if original_lsa.ttl <= 1 {
+        // Ne pas forwarder si le TTL est à 1 ou moins
+        return Ok(());
+    }
     let message = LSAMessage {
         message_type: 2,
         router_ip: router_ip.to_string(),
@@ -366,26 +370,17 @@ async fn update_routing_from_lsa(
     sender_ip: &str
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut routing_table = state.routing_table.lock().await;
-    
-    // Si c'est une LSA originale (pas de last_hop), le next_hop est l'expéditeur
-    let next_hop = if lsa.last_hop.is_none() {
-        sender_ip.to_string()
-    } else {
-        // Si la LSA a un last_hop, utiliser l'expéditeur comme next_hop
-        sender_ip.to_string()
-    };
-    
-    // Mettre à jour la route vers l'originateur de la LSA
-    if lsa.originator != sender_ip {
-        routing_table.insert(lsa.originator.clone(), next_hop.clone());
-        println!("Updated route: {} -> next_hop: {}", lsa.originator, next_hop);
-        
-        // Mettre à jour la table de routage système avec gestion d'erreur
-        if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
+
+    // Correction : éviter d'ajouter une route vers soi-même
+    if lsa.originator != sender_ip && lsa.originator != *routing_table.get(&lsa.originator).unwrap_or(&"".to_string()) {
+        routing_table.insert(lsa.originator.clone(), sender_ip.to_string());
+        println!("Updated route: {} -> next_hop: {}", lsa.originator, sender_ip);
+
+        if let Err(e) = update_routing_table_safe(&lsa.originator, sender_ip).await {
             log::warn!("Could not update system routing table for {}: {}", lsa.originator, e);
         }
     }
-    
+
     // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
     for neighbor in &lsa.neighbors {
         if neighbor.link_up {
