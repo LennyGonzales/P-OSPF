@@ -221,7 +221,7 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         enabled: Mutex::new(true), // Protocole activé par défaut
     });
 
-    // Ajouter les réseaux directs (interfaces locales) à la table de routage
+    // Ajouter les réseaux directs (réseaux des interfaces locales) à la table de routage
     {
         let mut routing_table = state.routing_table.lock().await;
         let interfaces = pnet::datalink::interfaces();
@@ -229,8 +229,9 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
             for ip_network in iface.ips {
                 if let IpAddr::V4(ipv4) = ip_network.ip() {
                     if !ipv4.is_loopback() {
+                        // Ajoute le réseau (ex: 192.168.1.0/24) comme destination
                         routing_table.insert(
-                            ip_network.to_string(),
+                            ip_network.network().to_string(),
                             ("-".to_string(), RouteState::Active(0)),
                         );
                     }
@@ -770,24 +771,26 @@ async fn update_routing_from_lsa(
         if dest == &state.local_ip {
             continue; // Ne pas ajouter de route vers soi-même
         }
-        
+        // N'essaye d'ajouter à la table système que si dest est une IP simple (pas un réseau)
+        let is_ip = dest.parse::<std::net::Ipv4Addr>().is_ok();
         match route_state {
             RouteState::Active(metric) => {
                 let existing_entry = routing_table.get(dest);
                 let new_metric = metric + 1; // Ajouter 1 à la métrique
-                
                 let should_update = match existing_entry {
                     Some((_, RouteState::Active(current_metric))) => new_metric < *current_metric,
                     Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
                     None => true, // Ajouter une nouvelle route
                 };
-                
                 if should_update {
                     routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
                     info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
-                    
-                    if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
-                        warn!("Could not update system routing table for {}: {}", dest, e);
+                    if is_ip {
+                        if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
+                            warn!("Could not update system routing table for {}: {}", dest, e);
+                        }
+                    } else {
+                        debug!("Not adding network {} to system routing table (logic only)", dest);
                     }
                 }
             },
