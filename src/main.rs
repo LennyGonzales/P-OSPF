@@ -132,6 +132,8 @@ struct AppState {
     routing_table: Mutex<HashMap<String, (String, RouteState)>>, // (next_hop, état)
     processed_lsa: Mutex<HashSet<(String, u32)>>, // (originator, seq_num) pour éviter de traiter plusieurs fois
     local_ip: String,
+    router_id: String,  // Router ID stable et unique
+    interfaces: HashMap<String, IpNetwork>,  // Toutes les interfaces du routeur
 }
 
 /// Récupère toutes les adresses de broadcast avec leurs interfaces locales associées
@@ -179,6 +181,43 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<()> {
     Ok(())
 }
 
+/// Détermination du Router ID au démarrage
+fn determine_router_id() -> Result<String> {
+    // Stratégie: prendre la plus haute adresse IP parmi toutes les interfaces
+    let mut highest_ip = Ipv4Addr::new(0, 0, 0, 0);
+    let interfaces = datalink::interfaces();
+    
+    // Chercher d'abord une interface de loopback (meilleur choix pour stabilité)
+    for iface in &interfaces {
+        for ip_network in &iface.ips {
+            if let IpNetwork::V4(ipv4_net) = ip_network {
+                let ip = ipv4_net.ip();
+                if ip.is_loopback() {
+                    return Ok(ip.to_string());
+                }
+            }
+        }
+    }
+    
+    // Sinon, prendre l'adresse IP la plus élevée
+    for iface in interfaces {
+        for ip_network in iface.ips {
+            if let IpNetwork::V4(ipv4_net) = ip_network {
+                let ip = ipv4_net.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() && ip > highest_ip {
+                    highest_ip = ip;
+                }
+            }
+        }
+    }
+    
+    if highest_ip == Ipv4Addr::new(0, 0, 0, 0) {
+        return Err(AppError::ConfigError("No valid interfaces found for Router ID".to_string()));
+    }
+    
+    Ok(highest_ip.to_string())
+}
+
 /// Point d'entrée principal du programme
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn StdError>> {
@@ -199,12 +238,30 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
     let socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", PORT)).await?);
     socket.set_broadcast(true)?;
 
+    let router_id = determine_router_id()?;
+    info!("Router ID: {}", router_id);
+    
+    // Collecter toutes les interfaces du routeur
+    let mut interfaces = HashMap::new();
+    for iface in datalink::interfaces() {
+        for ip_network in iface.ips {
+            if let IpNetwork::V4(ipv4_net) = ip_network {
+                let ip = ipv4_net.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    interfaces.insert(ip.to_string(), ip_network);
+                }
+            }
+        }
+    }
+    
     let state = Arc::new(AppState {
         topology: Mutex::new(HashMap::new()),
         neighbors: Mutex::new(HashMap::new()),
         routing_table: Mutex::new(HashMap::new()),
         processed_lsa: Mutex::new(HashSet::new()),
         local_ip: router_ip.clone(),
+        router_id: router_id.clone(),
+        interfaces,
     });
 
     // Ajout des routes directement connectées à la table de routage
@@ -214,7 +271,9 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
             for ip_network in iface.ips {
                 if let IpNetwork::V4(ipv4_network) = ip_network {
                     if !ipv4_network.ip().is_loopback() && !ipv4_network.ip().is_unspecified() {
+                        // Utiliser directement le réseau CIDR plutôt que l'adresse IP
                         let network_addr_cidr = format!("{}/{}", ipv4_network.network(), ipv4_network.prefix());
+                        
                         // Route vers le réseau connecté, métrique 0, next_hop est "0.0.0.0" (connecté)
                         routing_table.insert(
                             network_addr_cidr.clone(),
@@ -442,10 +501,14 @@ async fn update_neighbor(state: &Arc<AppState>, neighbor_ip: &str) {
 
 /// Vérifie l'état des voisins et marque comme inactifs ceux qui n'ont pas été vus récemment
 async fn check_neighbor_timeouts(state: &Arc<AppState>) {
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
+    let current_time = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(e) => {
+                error!("System time error: {}", e);
+                return;
+            }
+        };
         
     let mut neighbors = state.neighbors.lock().await;
     let mut changed = false;
@@ -465,14 +528,32 @@ async fn check_neighbor_timeouts(state: &Arc<AppState>) {
     if changed {
         // Envoyer une LSA pour informer du changement
         let broadcast_addrs = get_broadcast_addresses(PORT);
-        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap_or_else(|_| panic!("Failed to create socket"));
-        socket.set_broadcast(true).unwrap_or_else(|_| panic!("Failed to set broadcast"));
+        
+        // Création du socket avec gestion d'erreur appropriée
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to create socket for timeout notification: {}", e);
+                return;
+            }
+        };
+        
+        if let Err(e) = socket.set_broadcast(true) {
+            error!("Failed to set broadcast permission: {}", e);
+            return;
+        }
         
         for (local_ip, addr) in &broadcast_addrs {
             let seq_num = current_time as u32;
-            if let Err(e) = send_lsa(&socket, addr, local_ip, None, local_ip, Arc::clone(&state), seq_num, vec![]).await {
+            if let Err(e) = send_lsa(&socket, addr, &state.router_id, None, &state.router_id, 
+                                     Arc::clone(&state), seq_num, vec![]).await {
                 error!("Failed to send LSA after neighbor timeout: {}", e);
             }
+        }
+        
+        // Recalculer les routes avec l'algorithme SPF
+        if let Err(e) = run_spf_algorithm(&state).await {
+            error!("Failed to run SPF after neighbor timeout: {}", e);
         }
     }
 }
@@ -547,7 +628,9 @@ async fn send_lsa(
     let routing_table_guard = state.routing_table.lock().await;
     let mut route_states = HashMap::new();
     
-    for (dest, (next_hop, state)) in routing_table_guard.iter() {
+    // Assurer que nous partageons bien les routes réseau et non les adresses IP
+    for (dest, (_, state)) in routing_table_guard.iter() {
+        // dest devrait déjà être une adresse réseau CIDR
         route_states.insert(dest.clone(), state.clone());
     }
     drop(routing_table_guard);
@@ -619,6 +702,59 @@ fn get_local_ip() -> Result<String> {
     Err(AppError::ConfigError("No valid IP address found".to_string()))
 }
 
+/// Version améliorée pour obtenir le réseau associé à une adresse IP
+fn get_network_for_ip_improved(ip: &IpAddr) -> Option<(IpAddr, IpNetwork)> {
+    if let IpAddr::V4(ipv4) = ip {
+        // Recherche directe dans les interfaces locales
+        for interface in datalink::interfaces() {
+            for ip_network in &interface.ips {
+                if let IpNetwork::V4(network) = ip_network {
+                    if network.contains(*ipv4) {
+                        return Some((*ip, *ip_network));
+                    }
+                }
+            }
+        }
+        
+        // Si nous avons des informations sur le réseau du routeur distant
+        // Ceci serait idéalement renseigné par les LSA, mais comme solution basique:
+        let octets = ipv4.octets();
+        
+        // Heuristique basée sur les classes d'adresses traditionnelles
+        let prefix = if octets[0] < 128 {
+            // Classe A
+            8
+        } else if octets[0] < 192 {
+            // Classe B
+            16
+        } else if octets[0] < 224 {
+            // Classe C
+            24
+        } else {
+            // Adresse multicast ou spéciale, on suppose /24
+            24
+        };
+        
+        // Crée l'adresse réseau en mettant à zéro les bits d'hôte
+        let network_octets = match prefix {
+            8 => [octets[0], 0, 0, 0],
+            16 => [octets[0], octets[1], 0, 0],
+            _ => [octets[0], octets[1], octets[2], 0], // 24 bits ou plus
+        };
+        
+        if let Ok(network) = IpNetwork::new(
+            IpAddr::V4(Ipv4Addr::new(
+                network_octets[0], network_octets[1], network_octets[2], network_octets[3]
+            )),
+            prefix,
+        ) {
+            return Some((*ip, network));
+        }
+    }
+    
+    None
+}
+
 /// Met à jour la table de routage en fonction des informations d'un message LSA
 async fn update_routing_from_lsa(
     state: Arc<AppState>,
@@ -626,44 +762,49 @@ async fn update_routing_from_lsa(
     sender_ip: &str,
     socket: &UdpSocket
 ) -> Result<()> {
-    // Vérifier d'abord si le TTL est suffisant pour traiter cette LSA
+    // Vérification du TTL
     if lsa.ttl == 0 {
         debug!("Ignoring LSA with expired TTL");
         return Ok(());
     }
 
     let mut routing_table = state.routing_table.lock().await;
-
-    // Définir next_hop pour cette LSA
     let next_hop = sender_ip.to_string();
 
-    // Éviter d'ajouter une route vers soi-même
+    // Construire une route vers le réseau de l'originator plutôt que vers l'originator lui-même
     if lsa.originator != state.local_ip {
-        let existing_entry = routing_table.get(&lsa.originator);
-        let should_update = match existing_entry {
-            Some((current_next_hop, RouteState::Active(current_metric))) => {
-                // Si la route existe, mettre à jour si la nouvelle métrique est meilleure
-                match lsa.routing_table.get(&lsa.originator) {
-                    Some(RouteState::Active(new_metric)) => new_metric < current_metric,
-                    _ => false,
-                }
-            },
-            Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
-            None => true, // Ajouter une nouvelle route
-        };
-        
-        if should_update {
-            // Déterminer la métrique à utiliser
-            let metric = match lsa.routing_table.get(&lsa.originator) {
-                Some(RouteState::Active(m)) => *m + 1, // Ajouter 1 à la métrique
-                _ => 1, // Métrique par défaut pour une connexion directe
-            };
-            
-            routing_table.insert(lsa.originator.clone(), (next_hop.clone(), RouteState::Active(metric)));
-            info!("Updated route: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
+        // Extraire le réseau à partir de l'adresse IP
+        if let Ok(ip_addr) = lsa.originator.parse::<IpAddr>() {
+            if let Some((_, network_cidr)) = get_network_for_ip(&ip_addr) {
+                let network_str = network_cidr.to_string();
+                let existing_entry = routing_table.get(&network_str);
 
-            if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
-                warn!("Could not update system routing table for {}: {}", lsa.originator, e);
+                let should_update = match existing_entry {
+                    Some((current_next_hop, RouteState::Active(current_metric))) => {
+                        // Si la route existe, mettre à jour si la nouvelle métrique est meilleure
+                        match lsa.routing_table.get(&network_str) {
+                            Some(RouteState::Active(new_metric)) => new_metric < current_metric,
+                            _ => false,
+                        }
+                    },
+                    Some((_, RouteState::Unreachable)) => true, 
+                    None => true,
+                };
+                
+                if should_update {
+                    // Déterminer la métrique
+                    let metric = match lsa.routing_table.get(&network_str) {
+                        Some(RouteState::Active(m)) => *m + 1,
+                        _ => 1,
+                    };
+                    
+                    routing_table.insert(network_str.clone(), (next_hop.clone(), RouteState::Active(metric)));
+                    info!("Updated route: {} -> next_hop: {} (metric: {})", network_str, next_hop, metric);
+
+                    if let Err(e) = update_routing_table_safe(&network_str, &next_hop).await {
+                        warn!("Could not update system routing table for {}: {}", network_str, e);
+                    }
+                }
             }
         }
     }
@@ -675,58 +816,95 @@ async fn update_routing_from_lsa(
                 continue; // Ne pas ajouter de route vers soi-même
             }
             
-            let existing_entry = routing_table.get(&neighbor.neighbor_ip);
-            let neighbor_metric = if neighbor.capacity >= 100 {
-                1  // Métrique minimale pour les liens haute capacité
-            } else if neighbor.capacity > 0 {
-                (100 / neighbor.capacity.max(1)).min(15) as u32  // Limiter la métrique à 15 maximum
-            } else {
-                INFINITE_METRIC  // Pour éviter une division par zéro
-            };
-            
-            let should_update = match existing_entry {
-                Some((current_next_hop, RouteState::Active(current_metric))) => {
-                    // Si la route existe, mettre à jour si la nouvelle métrique est meilleure
-                    neighbor_metric + 1 < *current_metric
-                },
-                Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
-                None => true, // Ajouter une nouvelle route
-            };
-            
-            if should_update {
-                routing_table.insert(neighbor.neighbor_ip.clone(), 
-                                  (next_hop.clone(), RouteState::Active(neighbor_metric + 1)));
-                info!("Updated route: {} -> next_hop: {} (metric: {})", 
-                      neighbor.neighbor_ip, next_hop, neighbor_metric + 1);
-                
-                if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
-                    warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
+            // Obtenir l'adresse réseau plutôt que l'adresse IP du voisin
+            if let Ok(ip_addr) = neighbor.neighbor_ip.parse::<IpAddr>() {
+                if let Some((_, network_cidr)) = get_network_for_ip(&ip_addr) {
+                    let network_str = network_cidr.to_string();
+                    
+                    let existing_entry = routing_table.get(&network_str);
+                    let neighbor_metric = if neighbor.capacity >= 100 {
+                        1
+                    } else if neighbor.capacity > 0 {
+                        (100 / neighbor.capacity.max(1)).min(15) as u32
+                    } else {
+                        INFINITE_METRIC
+                    };
+                    
+                    let should_update = match existing_entry {
+                        Some((current_next_hop, RouteState::Active(current_metric))) => {
+                            neighbor_metric + 1 < *current_metric
+                        },
+                        Some((_, RouteState::Unreachable)) => true,
+                        None => true,
+                    };
+                    
+                    if should_update {
+                        routing_table.insert(network_str.clone(), 
+                                            (next_hop.clone(), RouteState::Active(neighbor_metric + 1)));
+                        info!("Updated route to network: {} -> next_hop: {} (metric: {})", 
+                              network_str, next_hop, neighbor_metric + 1);
+                        
+                        if let Err(e) = update_routing_table_safe(&network_str, &next_hop).await {
+                            warn!("Could not update system routing table for {}: {}", network_str, e);
+                        }
+                    }
                 }
             }
-        } else if routing_table.contains_key(&neighbor.neighbor_ip) {
-            // Le voisin est marqué comme inaccessible
-            info!("Route poisoning: {} -> unreachable", neighbor.neighbor_ip);
-            routing_table.insert(neighbor.neighbor_ip.clone(), 
-                              (next_hop.clone(), RouteState::Unreachable));
+        } else {
+            // Gérer les voisins inactifs (lien DOWN)
+            info!("Processing link DOWN for neighbor {} via {}", neighbor.neighbor_ip, sender_ip);
             
-            // Annoncer cette route comme empoisonée
-            let broadcast_addrs = get_broadcast_addresses(PORT);
-            for (local_ip, addr) in &broadcast_addrs {
-                let seq_num = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_else(|_| Duration::from_secs(0))
-                    .as_secs() as u32;
-                    
-                let path = vec![state.local_ip.clone()];
-                
-                if let Err(e) = send_poisoned_route(socket, addr, local_ip, &neighbor.neighbor_ip, 
-                                                  seq_num, path).await {
-                    error!("Failed to send poisoned route: {}", e);
+            // Chercher toutes les routes qui passent par ce next_hop
+            let mut routes_to_update = Vec::new();
+            
+            for (dest, (next_hop, _)) in routing_table.iter() {
+                // Si nous utilisions ce voisin comme next_hop pour cette route
+                if next_hop == sender_ip {
+                    routes_to_update.push(dest.clone());
                 }
+            }
+            
+            // Marquer ces routes comme inaccessibles ou les supprimer
+            for dest in routes_to_update {
+                info!("Marking route to {} via {} as unreachable (link DOWN)", dest, sender_ip);
+                routing_table.insert(dest.clone(), (sender_ip.to_string(), RouteState::Unreachable));
+                
+                // Essayer de supprimer cette route du système
+                let handle = match Handle::new() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Cannot create routing handle: {}", e);
+                        continue;
+                    }
+                };
+                
+                let (destination_ip, prefix) = if dest.contains('/') {
+                    match dest.parse::<IpNetwork>() {
+                        Ok(network) => (network.ip(), network.prefix()),
+                        Err(_) => continue,
+                    }
+                } else {
+                    match dest.parse::<IpAddr>() {
+                        Ok(ip) => (ip, 32),
+                        Err(_) => continue,
+                    }
+                };
+                
+                let route = Route::new(destination_ip, prefix);
+                if let Err(e) = handle.delete(&route).await {
+                    debug!("Failed to remove route {} from system table: {}", dest, e);
+                } else {
+                    info!("Removed unreachable route {} from system table", dest);
+                }
+            }
+            
+            // Relancer SPF pour trouver des chemins alternatifs si possible
+            if let Err(e) = run_spf_algorithm(&state).await {
+                error!("Failed to run SPF algorithm after link DOWN: {}", e);
             }
         }
     }
-
+    
     // Traiter la table de routage de la LSA
     for (dest, route_state) in &lsa.routing_table {
         if dest == &state.local_ip {
@@ -809,30 +987,22 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
 
     // Analyser la destination, qui peut être une IP ou un CIDR
     let (destination_ip, prefix) = if destination.contains('/') {
-        let cidr: IpNetwork = match destination.parse() {
-            Ok(c) => c,
-            Err(e) => return Err(AppError::RouteError(format!("Invalid destination CIDR {}: {}", destination, e))),
-        };
-        (cidr.ip(), cidr.prefix())
+        match destination.parse::<IpNetwork>() {
+            Ok(network) => (network.ip(), network.prefix()),
+            Err(_) => return Err(AppError::RouteError("Invalid destination format".to_string())),
+        }
     } else {
-        // Si pas de masque, on suppose une route /32 vers un hôte
-        let ip: IpAddr = match destination.parse() {
-            Ok(i) => i,
-            Err(e) => return Err(AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e))),
-        };
-        (ip, 32)
+        match destination.parse::<IpAddr>() {
+            Ok(ip) => (ip, 32),
+            Err(_) => return Err(AppError::RouteError("Invalid destination IP".to_string())),
+        }
     };
 
-    // Valider l'adresse de la passerelle
-    let gateway_ip: Ipv4Addr = gateway.parse()
-        .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
-
-    // Éviter d'ajouter des routes vers des adresses locales ou invalides
-    if destination_ip.is_loopback() || destination_ip.is_unspecified() || 
-       gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
-        debug!("Skipping route to invalid address: {} via {}", destination, gateway);
-        return Ok(());
-    }
+    // Analyser la gateway
+    let gateway_ip = match gateway.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => return Err(AppError::RouteError("Invalid gateway IP".to_string())),
+    };
 
     // Vérifier si on a les permissions pour modifier la table de routage
     let handle = match Handle::new() {
@@ -918,4 +1088,278 @@ mod tests {
         let routing_err = AppError::RoutingError("Routing failed".to_string());
         assert_eq!(format!("{}", routing_err), "Routing error: Routing failed");
     }
+}
+
+use std::collections::BinaryHeap;
+use std::cmp::Ordering;
+
+// Structure pour représenter un lien dans le graphe
+#[derive(Clone, Debug)]
+struct Link {
+    to_router: String,
+    metric: u32,
+}
+
+// Structure pour les éléments de la file de priorité de Dijkstra
+#[derive(Clone, Debug, Eq)]
+struct DijkstraNode {
+    router_id: String,
+    cost: u32,
+    next_hop: Option<String>,
+}
+
+impl Ord for DijkstraNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Inverser l'ordre pour que la file de priorité soit un min-heap
+        other.cost.cmp(&self.cost)
+    }
+}
+
+impl PartialOrd for DijkstraNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DijkstraNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cost == other.cost
+    }
+}
+
+// Fonction pour exécuter l'algorithme Dijkstra et mettre à jour la table de routage
+async fn run_spf_algorithm(state: &Arc<AppState>) -> Result<()> {
+    info!("Running SPF algorithm to recalculate routes");
+    
+    let topology_guard = state.topology.lock().await;
+    let mut graph = HashMap::new();
+    
+    // Construire le graphe à partir de la topologie
+    for (router_id, router) in topology_guard.iter() {
+        let mut links = Vec::new();
+        
+        for neighbor in &router.neighbors {
+            if neighbor.link_up {
+                // Calculer la métrique
+                let metric = if neighbor.capacity >= 100 {
+                    1
+                } else if neighbor.capacity > 0 {
+                    (100 / neighbor.capacity.max(1)).min(15) as u32
+                } else {
+                    INFINITE_METRIC
+                };
+                
+                links.push(Link {
+                    to_router: neighbor.neighbor_ip.clone(),
+                    metric,
+                });
+            }
+        }
+        
+        graph.insert(router_id.clone(), links);
+    }
+    
+    // Ajouter ce routeur local au graphe avec ses voisins
+    let mut local_links = Vec::new();
+    let neighbors_guard = state.neighbors.lock().await;
+    
+    for (neighbor_ip, neighbor) in neighbors_guard.iter() {
+        if neighbor.link_up {
+            let metric = if neighbor.capacity >= 100 {
+                1
+            } else if neighbor.capacity > 0 {
+                (100 / neighbor.capacity.max(1)).min(15) as u32
+            } else {
+                INFINITE_METRIC
+            };
+            
+            local_links.push(Link {
+                to_router: neighbor_ip.clone(),
+                metric,
+            });
+        }
+    }
+    
+    graph.insert(state.router_id.clone(), local_links);
+    drop(neighbors_guard);
+    drop(topology_guard);
+    
+    // Exécuter l'algorithme de Dijkstra
+    let mut distances = HashMap::new();
+    let mut next_hops = HashMap::new();
+    let mut pq = BinaryHeap::new();
+    
+    // Commencer par ce routeur
+    pq.push(DijkstraNode {
+        router_id: state.router_id.clone(),
+        cost: 0,
+        next_hop: None,
+    });
+    
+    distances.insert(state.router_id.clone(), 0);
+    
+    while let Some(DijkstraNode { router_id, cost, next_hop }) = pq.pop() {
+        // Si nous avons déjà trouvé un chemin plus court
+        if let Some(&dist) = distances.get(&router_id) {
+            if cost > dist {
+                continue;
+            }
+        }
+        
+        // Pour le premier saut depuis la source, le next_hop devient l'ID du routeur voisin
+        let real_next_hop = next_hop.clone().unwrap_or(router_id.clone());
+        
+        // Enregistrer le next_hop pour ce routeur
+        if router_id != state.router_id {
+            next_hops.insert(router_id.clone(), real_next_hop.clone());
+        }
+        
+        // Explorer les voisins
+        if let Some(links) = graph.get(&router_id) {
+            for link in links {
+                let new_cost = cost + link.metric;
+                
+                // Si nous avons trouvé un chemin plus court vers ce voisin
+                let is_better_path = match distances.get(&link.to_router) {
+                    Some(&current_cost) => new_cost < current_cost,
+                    None => true,
+                };
+                
+                if is_better_path {
+                    distances.insert(link.to_router.clone(), new_cost);
+                    
+                    // Le first_hop reste le même pour tous les nœuds dans le chemin
+                    let next_hop_to_use = if router_id == state.router_id {
+                        Some(link.to_router.clone())
+                    } else {
+                        next_hop.clone()
+                    };
+                    
+                    pq.push(DijkstraNode {
+                        router_id: link.to_router.clone(),
+                        cost: new_cost,
+                        next_hop: next_hop_to_use,
+                    });
+                }
+            }
+        }
+    }
+    
+    // Mettre à jour la table de routage avec les résultats de Dijkstra
+    update_routing_table_from_spf(state, &distances, &next_hops).await?;
+    
+    Ok(())
+}
+
+// Mettre à jour la table de routage à partir des résultats de l'algorithme SPF
+async fn update_routing_table_from_spf(
+    state: &Arc<AppState>,
+    distances: &HashMap<String, u32>,
+    next_hops: &HashMap<String, String>
+) -> Result<()> {
+    let mut routing_table = state.routing_table.lock().await;
+    
+    // Collecter les réseaux annoncés par chaque routeur
+    let topology_guard = state.topology.lock().await;
+    let mut router_networks = HashMap::new();
+    
+    for (router_id, router) in topology_guard.iter() {
+        // Chercher les réseaux annoncés par ce routeur
+        if let Ok(ip) = router_id.parse::<IpAddr>() {
+            if let Some(networks) = get_all_networks_for_router(router) {
+                for network in networks {
+                    router_networks.insert(network.to_string(), (router_id.clone(), ip));
+                }
+            }
+        }
+    }
+    drop(topology_guard);
+    
+    // Nettoyer la table de routage (conserver uniquement les routes directement connectées)
+    let connected_routes: Vec<String> = routing_table.iter()
+        .filter(|(_, (next_hop, state))| next_hop == "0.0.0.0" && matches!(state, RouteState::Active(_)))
+        .map(|(dest, _)| dest.clone())
+        .collect();
+    
+    routing_table.clear();
+    
+    // Restaurer les routes directement connectées
+    for route in connected_routes {
+        routing_table.insert(route, ("0.0.0.0".to_string(), RouteState::Active(0)));
+    }
+    
+    // Ajouter les routes calculées par SPF
+    for (network, (router_id, _)) in router_networks {
+        if let Some(next_hop) = next_hops.get(router_id) {
+            if let Some(&distance) = distances.get(router_id) {
+                // Obtenir l'adresse IP du next_hop
+                if let Ok(next_hop_ip) = get_ip_for_router_id(state, next_hop).await {
+                    routing_table.insert(
+                        network.clone(),
+                        (next_hop_ip.clone(), RouteState::Active(distance))
+                    );
+                    
+                    // Mettre à jour la table de routage du système
+                    if let Err(e) = update_routing_table_safe(&network, &next_hop_ip).await {
+                        warn!("Failed to update system routing table for {}: {}", network, e);
+                    } else {
+                        info!("Updated route: {} -> next_hop: {} (metric: {})", 
+                             network, next_hop_ip, distance);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// Nouvelle fonction pour obtenir tous les réseaux annoncés par un routeur
+fn get_all_networks_for_router(router: &Router) -> Option<Vec<IpNetwork>> {
+    let mut networks = Vec::new();
+    
+    // Ajouter le réseau principal du routeur
+    if let Ok(ip) = router.router_ip.parse::<IpAddr>() {
+        if let Some((_, network)) = get_network_for_ip_improved(&ip) {
+            networks.push(network);
+        }
+    }
+    
+    // Ajouter les réseaux des voisins
+    for neighbor in &router.neighbors {
+        if neighbor.link_up {
+            if let Ok(ip) = neighbor.neighbor_ip.parse::<IpAddr>() {
+                if let Some((_, network)) = get_network_for_ip_improved(&ip) {
+                    if !networks.contains(&network) {
+                        networks.push(network);
+                    }
+                }
+            }
+        }
+    }
+    
+    if networks.is_empty() {
+        None
+    } else {
+        Some(networks)
+    }
+}
+
+/// Fonction pour obtenir l'IP correspondant à un Router ID
+async fn get_ip_for_router_id(state: &Arc<AppState>, router_id: &str) -> Result<String> {
+    // Si c'est notre Router ID, trouver une IP locale appropriée
+    if router_id == state.router_id {
+        return Ok(state.local_ip.clone());
+    }
+    
+    // Chercher parmi les voisins directs
+    let neighbors = state.neighbors.lock().await;
+    for (ip, neighbor) in neighbors.iter() {
+        if neighbor.neighbor_ip == router_id {
+            return Ok(ip.clone());
+        }
+    }
+    
+    // Si pas trouvé, utiliser le router_id comme IP (ils pourraient être identiques)
+    Ok(router_id.to_string())
 }
