@@ -784,12 +784,8 @@ async fn update_routing_from_lsa(
                 };
                 if should_update {
                     // On tente de parser la clé dest comme un réseau (IpNetwork)
-                    if let Ok(ipnet) = dest.parse::<IpNetwork>() {
-                        routing_table.insert(ipnet.to_string(), (next_hop.clone(), RouteState::Active(new_metric)));
-                        info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", ipnet, next_hop, new_metric);
-                    } else if let Ok(ipv4) = dest.parse::<std::net::Ipv4Addr>() {
-                        // Si c'est une IP, on tente de retrouver le bon préfixe à partir de la LSA ou d'une table connue
-                        // Ici, on suppose /24 par défaut (à adapter selon ton réseau)
+                    if let Ok(ipv4) = dest.parse::<std::net::Ipv4Addr>() {
+                        // Si c'est une IP, on force le réseau /24
                         let ipnet = IpNetwork::V4(pnet::ipnetwork::Ipv4Network::new(ipv4, 24).unwrap());
                         routing_table.insert(ipnet.to_string(), (next_hop.clone(), RouteState::Active(new_metric)));
                         info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", ipnet, next_hop, new_metric);
