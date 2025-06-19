@@ -12,6 +12,8 @@ use pnet::ipnetwork::IpNetwork;
 use std::fmt;
 use std::error::Error as StdError;
 
+mod read_interfaces;
+
 // Constantes de configuration
 const PORT: u16 = 5000;
 const HELLO_INTERVAL_SEC: u64 = 20;
@@ -202,6 +204,23 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         processed_lsa: Mutex::new(HashSet::new()),
         local_ip: router_ip.clone(),
     });
+
+    // Charger la configuration des interfaces et construire une map nom -> capacité
+    let config_path = format!("src/conf/config_{}.toml", hostname::get().unwrap_or_default().to_string_lossy());
+    let interface_config = match read_interfaces::read_interfaces_config(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Erreur lors de la lecture de la config des interfaces: {}", e);
+            return Err(e.into()); // Correction : ne pas boxer deux fois l'erreur
+        }
+    };
+    let interface_capacities: std::collections::HashMap<String, u32> =
+        interface_config.interfaces.iter().map(|iface| (iface.name.clone(), iface.capacity_mbps)).collect();
+
+    info!("Interfaces chargées depuis {} :", config_path);
+    for iface in &interface_config.interfaces {
+        info!("- {} : {} Mbps", iface.name, iface.capacity_mbps);
+    }
 
     // Tâche pour envoyer périodiquement des messages Hello
     let socket_clone = Arc::clone(&socket);
