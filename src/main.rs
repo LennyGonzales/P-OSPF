@@ -881,9 +881,11 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
 
     // Ajout effectif de la route système avec /24 via net_route
     let handle = Handle::new().map_err(|e| AppError::RouteError(format!("net_route handle: {}", e)))?;
-    let route = Route::new(IpAddr::V4(dest_ip), prefix);
+    // On force la destination à être un réseau /24 (192.168.x.0/24)
+    let dest_network = IpNetwork::V4(pnet::ipnetwork::Ipv4Network::new(dest_ip, 24).unwrap());
+    let route = Route::new(dest_network.ip(), dest_network.prefix());
     handle.add(&route).await.map_err(|e| AppError::RouteError(format!("net_route add: {}", e)))?;
-    info!("[SYSTEM] Route ajoutée (net_route) : {}/{} via {}", dest_ip, prefix, gateway_ip);
+    info!("[SYSTEM] Route ajoutée (net_route) : {}/{} via {}", dest_network.ip(), dest_network.prefix(), gateway_ip);
     Ok(())
 }
 
