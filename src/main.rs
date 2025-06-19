@@ -182,6 +182,11 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<()> {
 /// Point d'entrée principal du programme
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn StdError>> {
+    
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+
     env_logger::init();
 
     let router_ip = get_local_ip()?;
