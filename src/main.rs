@@ -748,7 +748,7 @@ async fn update_routing_from_lsa(
             routing_table.insert(neighbor.neighbor_ip.clone(), 
                               (next_hop.clone(), RouteState::Unreachable));
             
-            // Annoncer cette route comme empoisonnée
+            // Annoncer cette route comme empoisonée
             let broadcast_addrs = get_broadcast_addresses(PORT);
             for (local_ip, addr) in &broadcast_addrs {
                 let seq_num = std::time::SystemTime::now()
@@ -783,8 +783,15 @@ async fn update_routing_from_lsa(
                     None => true, // Ajouter une nouvelle route
                 };
                 if should_update {
-                    routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                    info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
+                    // On tente de parser la clé dest comme un réseau (IpNetwork)
+                    if let Ok(ipnet) = dest.parse::<IpNetwork>() {
+                        routing_table.insert(ipnet.to_string(), (next_hop.clone(), RouteState::Active(new_metric)));
+                        info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", ipnet, next_hop, new_metric);
+                    } else {
+                        routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
+                        info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
+                    }
+
                     if is_ip {
                         if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
                             warn!("Could not update system routing table for {}: {}", dest, e);
