@@ -144,13 +144,13 @@ fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
         .flat_map(|iface: NetworkInterface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ip) = ip_network.ip() {
-                    if !ip.is_loopback() { // Exclure les adresses de loopback
-                        if let IpNetwork::V4(ipv4_network) = ip_network {
-                            let broadcast = ipv4_network.broadcast();
-                            Some((ip.to_string(), SocketAddr::new(IpAddr::V4(broadcast), port)))
-                        } else {
-                            None
-                        }
+                    if !ip.is_loopback() {
+                        // Calculer l'adresse de broadcast pour ce réseau
+                        let broadcast_addr = ip_network.broadcast();
+                        Some((
+                            ip.to_string(),
+                            SocketAddr::new(IpAddr::V4(broadcast_addr), port),
+                        ))
                     } else {
                         None
                     }
@@ -166,7 +166,7 @@ fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
 async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<()> {
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| AppError::ConfigError(e.to_string()))?
+        .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs();
         
     let mut topology = state.topology.lock().await;
@@ -187,7 +187,7 @@ fn determine_router_id() -> Result<String> {
     let mut highest_ip = Ipv4Addr::new(0, 0, 0, 0);
     let interfaces = datalink::interfaces();
     
-    // Chercher d'abord une interface de loopback (meilleur choix pour stabilité)
+    // Chercher d'abord une interface loopback
     for iface in &interfaces {
         for ip_network in &iface.ips {
             if let IpNetwork::V4(ipv4_net) = ip_network {
@@ -270,23 +270,19 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         for iface in datalink::interfaces() {
             for ip_network in iface.ips {
                 if let IpNetwork::V4(ipv4_network) = ip_network {
-                    if !ipv4_network.ip().is_loopback() && !ipv4_network.ip().is_unspecified() {
-                        // Utiliser directement le réseau CIDR plutôt que l'adresse IP
-                        let network_addr_cidr = format!("{}/{}", ipv4_network.network(), ipv4_network.prefix());
-                        
-                        // Route vers le réseau connecté, métrique 0, next_hop est "0.0.0.0" (connecté)
-                        routing_table.insert(
-                            network_addr_cidr.clone(),
-                            ("0.0.0.0".to_string(), RouteState::Active(0))
-                        );
-                        info!("Added directly connected route: {} (metric 0)", network_addr_cidr);
+                    let ip = ipv4_network.ip();
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        // Représenter le réseau sous forme CIDR
+                        let network_str = ipv4_network.to_string();
+                        // Next hop = 0.0.0.0 pour indiquer route connectée
+                        routing_table.insert(network_str, ("0.0.0.0".to_string(), RouteState::Active(0)));
                     }
                 }
             }
         }
     }
 
-    // Tâche pour envoyer périodiquement des messages Hello
+    // Tâche pour envoyer périodiquement des messages Hello et LSA
     let socket_clone = Arc::clone(&socket);
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
@@ -299,20 +295,18 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
                     let broadcast_addrs = get_broadcast_addresses(PORT);
                     for (local_ip, addr) in &broadcast_addrs {
                         if let Err(e) = send_hello(&socket_clone, addr, local_ip).await {
-                            error!("Failed to send hello to {}: {}", addr, e);
+                            error!("Failed to send Hello: {}", e);
                         }
                     }
                 }
                 _ = lsa_interval.tick() => {
                     let broadcast_addrs = get_broadcast_addresses(PORT);
                     for (local_ip, addr) in &broadcast_addrs {
-                        // Générer un numéro de séquence unique basé sur le timestamp
-                        let seq_num = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_else(|_| Duration::from_secs(0))
-                            .as_secs() as u32;
-                            
-                        if let Err(e) = send_lsa(&socket_clone, addr, local_ip, None, local_ip, Arc::clone(&state_clone), seq_num, vec![]).await {
+                        let seq_num = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                            Ok(d) => d.as_secs() as u32,
+                            Err(_) => 0,
+                        };
+                        if let Err(e) = send_lsa(&socket_clone, addr, local_ip, None, &state_clone.router_id, Arc::clone(&state_clone), seq_num, vec![]).await {
                             error!("Failed to send LSA: {}", e);
                         }
                     }
@@ -322,13 +316,13 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
     });
 
     // Tâche pour surveiller l'état des voisins
-    let state_clone = Arc::clone(&state);
+    let state_monitor = Arc::clone(&state);
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(NEIGHBOR_TIMEOUT_SEC / 2));
         
         loop {
             interval.tick().await;
-            check_neighbor_timeouts(&state_clone).await;
+            check_neighbor_timeouts(&state_monitor).await;
         }
     });
 
@@ -340,7 +334,7 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         .flat_map(|iface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ipv4) = ip_network.ip() {
-                    if !ipv4.is_loopback() { // Exclude loopback addresses
+                    if !ipv4.is_loopback() {
                         Some((IpAddr::V4(ipv4), (ipv4.to_string(), ip_network)))
                     } else {
                         None
@@ -367,100 +361,27 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
             Ok((ip, network)) => (ip, network),
             Err(e) => {
                 error!("Failed to determine receiving interface: {}", e);
-                continue; // Skip processing this packet
+                continue;
             }
         };
 
         match serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
             Ok(json) => {
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
-                    match message_type {
-                        1 => {
-                            if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
-                                info!("[RECV] HELLO from {} - {} (received on interface {})", 
-                                    hello.router_ip, src_addr, receiving_interface_ip);
-                                
-                                update_neighbor(&state, &hello.router_ip).await;
-                                
-                                // Calculer l'adresse de broadcast pour l'interface qui a reçu le HELLO
-                                let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, &receiving_network, PORT)?;
-                                
-                                // Générer un numéro de séquence unique
-                                let seq_num = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_else(|_| Duration::from_secs(0))
-                                    .as_secs() as u32;
-                                
-                                // Envoyer la LSA avec l'IP de l'interface qui a reçu le HELLO
-                                if let Err(e) = send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, 
-                                                        None, &receiving_interface_ip, Arc::clone(&state), 
-                                                        seq_num, vec![receiving_interface_ip.clone()]).await {
-                                    error!("Failed to send LSA after HELLO: {}", e);
-                                }
+                    if message_type == 1 {
+                        // Message Hello
+                        if let Ok(hello_msg) = serde_json::from_value::<HelloMessage>(json.clone()) {
+                            // Mettre à jour l'état du voisin
+                            update_neighbor(&state, &hello_msg.router_ip).await;
+                        }
+                    } else if message_type == 2 {
+                        // Message LSA
+                        if let Ok(lsa_msg) = serde_json::from_value::<LSAMessage>(json.clone()) {
+                            if let Err(e) = process_lsa(&state, &lsa_msg, &receiving_interface_ip, &socket).await {
+                                warn!("Failed to process LSA: {}", e);
                             }
                         }
-                        2 => {
-                            if let Ok(lsa) = serde_json::from_value::<LSAMessage>(json) {
-                                info!("[RECV] LSA from {} (originator: {}, last_hop: {:?}, seq: {}) on interface {}", 
-                                    src_addr, lsa.originator, lsa.last_hop, lsa.seq_num, receiving_interface_ip);
-                                
-                                // Vérifier si nous avons déjà traité ce LSA
-                                let should_process = {
-                                    let mut processed = state.processed_lsa.lock().await;
-                                    let key = (lsa.originator.clone(), lsa.seq_num);
-                                    if !processed.contains(&key) {
-                                        processed.insert(key);
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                };
-                                
-                                if should_process && lsa.ttl > 0 {
-                                    // Ne pas traiter ses propres LSA relayés
-                                    if lsa.originator != receiving_interface_ip {
-                                        // Vérifier si cette LSA contient notre adresse dans le chemin (pour éviter les boucles)
-                                        let path_contains_us = lsa.path.contains(&receiving_interface_ip);
-                                        
-                                        if !path_contains_us {
-                                            // Mettre à jour la table de routage
-                                            if let Err(e) = update_routing_from_lsa(Arc::clone(&state), &lsa, 
-                                                                                  &src_addr.ip().to_string(), &socket).await {
-                                                error!("Failed to update routing from LSA: {}", e);
-                                            }
-                                            
-                                            if let Err(e) = update_topology(Arc::clone(&state), &lsa).await {
-                                                error!("Failed to update topology: {}", e);
-                                            }
-                                            
-                                            // Retransmettre la LSA
-                                            let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, &receiving_network, PORT)?;
-                                            
-                                            // Créer un nouveau chemin incluant notre adresse
-                                            let mut new_path = lsa.path.clone();
-                                            new_path.push(receiving_interface_ip.clone());
-                                            
-                                            if let Err(e) = forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, 
-                                                                      &lsa, new_path).await {
-                                                error!("Failed to forward LSA: {}", e);
-                                            }
-                                        } else {
-                                            debug!("Not forwarding LSA as it would create a loop");
-                                        }
-                                    } else {
-                                        debug!("Not processing our own LSA");
-                                    }
-                                } else if !should_process {
-                                    debug!("Ignoring duplicate LSA (originator: {}, seq: {})", lsa.originator, lsa.seq_num);
-                                } else {
-                                    debug!("LSA TTL expired, not forwarding");
-                                }
-                            }
-                        }
-                        _ => warn!("Unknown message type: {}", message_type),
                     }
-                } else {
-                    warn!("No message_type field in received JSON");
                 }
             }
             Err(e) => {
@@ -479,7 +400,6 @@ async fn update_neighbor(state: &Arc<AppState>, neighbor_ip: &str) {
         
     let mut neighbors = state.neighbors.lock().await;
     
-    // Mettre à jour ou créer l'entrée du voisin
     neighbors.entry(neighbor_ip.to_string())
         .and_modify(|n| {
             n.last_seen = current_time;
@@ -513,7 +433,6 @@ async fn check_neighbor_timeouts(state: &Arc<AppState>) {
     let mut neighbors = state.neighbors.lock().await;
     let mut changed = false;
     
-    // Vérifier tous les voisins
     for (ip, neighbor) in neighbors.iter_mut() {
         if neighbor.link_up && current_time - neighbor.last_seen > NEIGHBOR_TIMEOUT_SEC {
             warn!("Neighbor {} is DOWN (timeout)", ip);
@@ -524,12 +443,9 @@ async fn check_neighbor_timeouts(state: &Arc<AppState>) {
     
     drop(neighbors);
     
-    // Si des voisins ont été marqués comme inactifs, mettre à jour les routes
+    // Si des voisins ont été marqués comme inactifs, émettre une LSA et relancer SPF
     if changed {
-        // Envoyer une LSA pour informer du changement
         let broadcast_addrs = get_broadcast_addresses(PORT);
-        
-        // Création du socket avec gestion d'erreur appropriée
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(e) => {
@@ -543,19 +459,59 @@ async fn check_neighbor_timeouts(state: &Arc<AppState>) {
             return;
         }
         
-        for (local_ip, addr) in &broadcast_addrs {
+        for (_, addr) in &broadcast_addrs {
             let seq_num = current_time as u32;
-            if let Err(e) = send_lsa(&socket, addr, &state.router_id, None, &state.router_id, 
-                                     Arc::clone(&state), seq_num, vec![]).await {
+            if let Err(e) = send_lsa(&socket, addr, &state.router_id, None, &state.router_id, Arc::clone(state), seq_num, vec![]).await {
                 error!("Failed to send LSA after neighbor timeout: {}", e);
             }
         }
         
-        // Recalculer les routes avec l'algorithme SPF
-        if let Err(e) = run_spf_algorithm(&state).await {
+        if let Err(e) = run_spf_algorithm(state).await {
             error!("Failed to run SPF after neighbor timeout: {}", e);
         }
     }
+}
+
+/// Permet de traiter un message LSA
+async fn process_lsa(
+    state: &Arc<AppState>,
+    lsa: &LSAMessage,
+    sender_ip: &str,
+    socket: &UdpSocket
+) -> Result<()> {
+    // Vérifier si on a déjà traité ce LSA
+    {
+        let mut processed = state.processed_lsa.lock().await;
+        if processed.contains(&(lsa.originator.clone(), lsa.seq_num)) {
+            debug!("LSA {} (seq {}) from {} already processed", lsa.originator, lsa.seq_num, sender_ip);
+            return Ok(());
+        }
+        processed.insert((lsa.originator.clone(), lsa.seq_num));
+    }
+
+    update_topology(Arc::clone(state), lsa).await?;
+    update_routing_from_lsa(Arc::clone(state), lsa, sender_ip, socket).await?;
+
+    // Transférer ce LSA vers d'autres routeurs
+    let broadcast_addrs = get_broadcast_addresses(PORT);
+    let mut path = lsa.path.clone();
+    path.push(state.router_id.clone());
+    
+    for (local_ip, addr) in &broadcast_addrs {
+        // Éviter d'envoyer à l'interface source
+        if local_ip == sender_ip {
+            continue;
+        }
+        forward_lsa(
+            socket,
+            addr,
+            &state.router_id,
+            lsa,
+            path.clone()
+        ).await?;
+    }
+    
+    Ok(())
 }
 
 /// Fonction pour déterminer l'IP de l'interface qui a reçu le paquet
@@ -564,10 +520,17 @@ fn determine_receiving_interface(
     local_ips: &HashMap<IpAddr, (String, IpNetwork)>,
 ) -> Result<(String, IpNetwork)> {
     if let IpAddr::V4(sender_ipv4) = sender_ip {
-        // Chercher l'interface locale qui est sur le même réseau que l'expéditeur
-        for (local_ip, (local_ip_str, ip_network)) in local_ips {
+        for (_, (local_ip_str, ip_network)) in local_ips {
             if let IpNetwork::V4(ipv4_network) = ip_network {
                 if ipv4_network.contains(*sender_ipv4) {
+                    return Ok((local_ip_str.clone(), ip_network.clone()));
+                }
+            }
+        }
+    } else if let IpAddr::V6(sender_ipv6) = sender_ip {
+        for (_, (local_ip_str, ip_network)) in local_ips {
+            if let IpNetwork::V6(ipv6_network) = ip_network {
+                if ipv6_network.contains(*sender_ipv6) {
                     return Ok((local_ip_str.clone(), ip_network.clone()));
                 }
             }
@@ -575,20 +538,23 @@ fn determine_receiving_interface(
     }
 
     // Si aucune correspondance directe n'est trouvée, utiliser l'interface par défaut
-    for (local_ip, (local_ip_str, ip_network)) in local_ips {
-        if let IpAddr::V4(ipv4) = local_ip {
-            if !ipv4.is_loopback() && !ipv4.is_unspecified() {
-                warn!("Could not determine exact receiving interface for {}, using {} as default", 
-                     sender_ip, local_ip_str);
+    for (_, (local_ip_str, ip_network)) in local_ips {
+        match ip_network.ip() {
+            IpAddr::V4(ipv4) if !ipv4.is_loopback() && !ipv4.is_unspecified() => {
+                warn!("No matching interface for {}, using {} as default", sender_ip, local_ip_str);
                 return Ok((local_ip_str.clone(), ip_network.clone()));
             }
+            IpAddr::V6(ipv6) if !ipv6.is_loopback() && !ipv6.is_unspecified() => {
+                warn!("No matching interface for {}, using {} as default", sender_ip, local_ip_str);
+                return Ok((local_ip_str.clone(), ip_network.clone()));
+            }
+            _ => {}
         }
     }
-
     Err(AppError::NetworkError("No valid receiving interface found".to_string()))
 }
 
-/// Fonction pour calculer l'adresse de broadcast pour une interface donnée
+/// Fonction pour calculer l'adresse de broadcast pour une interface (test unitaire)
 fn calculate_broadcast_for_interface(interface_ip: &str, ip_network: &IpNetwork, port: u16) -> Result<SocketAddr> {
     if let IpNetwork::V4(ipv4_network) = ip_network {
         let broadcast_addr = ipv4_network.broadcast();
@@ -627,11 +593,8 @@ async fn send_lsa(
 
     let routing_table_guard = state.routing_table.lock().await;
     let mut route_states = HashMap::new();
-    
-    // Assurer que nous partageons bien les routes réseau et non les adresses IP
-    for (dest, (_, state)) in routing_table_guard.iter() {
-        // dest devrait déjà être une adresse réseau CIDR
-        route_states.insert(dest.clone(), state.clone());
+    for (dest, (_, state_val)) in routing_table_guard.iter() {
+        route_states.insert(dest.clone(), state_val.clone());
     }
     drop(routing_table_guard);
 
@@ -710,36 +673,28 @@ fn get_network_for_ip_improved(ip: &IpAddr) -> Option<(IpAddr, IpNetwork)> {
             for ip_network in &interface.ips {
                 if let IpNetwork::V4(network) = ip_network {
                     if network.contains(*ipv4) {
-                        return Some((*ip, *ip_network));
+                        return Some((*ip, *network));
                     }
                 }
             }
         }
         
-        // Si nous avons des informations sur le réseau du routeur distant
-        // Ceci serait idéalement renseigné par les LSA, mais comme solution basique:
+        // Heuristique basée sur les classes classiques
         let octets = ipv4.octets();
-        
-        // Heuristique basée sur les classes d'adresses traditionnelles
         let prefix = if octets[0] < 128 {
-            // Classe A
             8
         } else if octets[0] < 192 {
-            // Classe B
             16
         } else if octets[0] < 224 {
-            // Classe C
             24
         } else {
-            // Adresse multicast ou spéciale, on suppose /24
             24
         };
         
-        // Crée l'adresse réseau en mettant à zéro les bits d'hôte
         let network_octets = match prefix {
             8 => [octets[0], 0, 0, 0],
             16 => [octets[0], octets[1], 0, 0],
-            _ => [octets[0], octets[1], octets[2], 0], // 24 bits ou plus
+            _ => [octets[0], octets[1], octets[2], 0],
         };
         
         if let Ok(network) = IpNetwork::new(
@@ -751,8 +706,12 @@ fn get_network_for_ip_improved(ip: &IpAddr) -> Option<(IpAddr, IpNetwork)> {
             return Some((*ip, network));
         }
     }
-    
     None
+}
+
+/// Obtient le réseau associé à une adresse IP
+fn get_network_for_ip(ip: &IpAddr) -> Option<(IpAddr, IpNetwork)> {
+    get_network_for_ip_improved(ip)
 }
 
 /// Met à jour la table de routage en fonction des informations d'un message LSA
@@ -762,7 +721,6 @@ async fn update_routing_from_lsa(
     sender_ip: &str,
     socket: &UdpSocket
 ) -> Result<()> {
-    // Vérification du TTL
     if lsa.ttl == 0 {
         debug!("Ignoring LSA with expired TTL");
         return Ok(());
@@ -771,36 +729,25 @@ async fn update_routing_from_lsa(
     let mut routing_table = state.routing_table.lock().await;
     let next_hop = sender_ip.to_string();
 
-    // Construire une route vers le réseau de l'originator plutôt que vers l'originator lui-même
+    // Construire une route vers le réseau de l'originator
     if lsa.originator != state.local_ip {
-        // Extraire le réseau à partir de l'adresse IP
         if let Ok(ip_addr) = lsa.originator.parse::<IpAddr>() {
             if let Some((_, network_cidr)) = get_network_for_ip(&ip_addr) {
                 let network_str = network_cidr.to_string();
                 let existing_entry = routing_table.get(&network_str);
-
+                // S'il n'y a pas de route ou si la route actuelle est moins intéressante
                 let should_update = match existing_entry {
-                    Some((current_next_hop, RouteState::Active(current_metric))) => {
-                        // Si la route existe, mettre à jour si la nouvelle métrique est meilleure
-                        match lsa.routing_table.get(&network_str) {
-                            Some(RouteState::Active(new_metric)) => new_metric < current_metric,
-                            _ => false,
-                        }
-                    },
-                    Some((_, RouteState::Unreachable)) => true, 
                     None => true,
+                    Some((_, RouteState::Unreachable)) => true,
+                    Some((_, RouteState::Active(current_metric))) => {
+                        // On ne connaît pas la métrique de l'originator ici,
+                        // donc on choisit de mettre 1 par défaut ou +1 si on veut
+                        // refléter la distance
+                        *current_metric > 1
+                    }
                 };
-                
                 if should_update {
-                    // Déterminer la métrique
-                    let metric = match lsa.routing_table.get(&network_str) {
-                        Some(RouteState::Active(m)) => *m + 1,
-                        _ => 1,
-                    };
-                    
-                    routing_table.insert(network_str.clone(), (next_hop.clone(), RouteState::Active(metric)));
-                    info!("Updated route: {} -> next_hop: {} (metric: {})", network_str, next_hop, metric);
-
+                    routing_table.insert(network_str.clone(), (next_hop.clone(), RouteState::Active(1)));
                     if let Err(e) = update_routing_table_safe(&network_str, &next_hop).await {
                         warn!("Could not update system routing table for {}: {}", network_str, e);
                     }
@@ -809,41 +756,25 @@ async fn update_routing_from_lsa(
         }
     }
 
-    // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
+    // Mettre à jour les routes vers tous les voisins de la LSA
     for neighbor in &lsa.neighbors {
         if neighbor.link_up {
             if neighbor.neighbor_ip == state.local_ip {
-                continue; // Ne pas ajouter de route vers soi-même
+                continue; // Éviter de s'auto-ajouter
             }
-            
-            // Obtenir l'adresse réseau plutôt que l'adresse IP du voisin
             if let Ok(ip_addr) = neighbor.neighbor_ip.parse::<IpAddr>() {
                 if let Some((_, network_cidr)) = get_network_for_ip(&ip_addr) {
                     let network_str = network_cidr.to_string();
-                    
+                    // Vérifier si on doit mettre à jour la route
                     let existing_entry = routing_table.get(&network_str);
-                    let neighbor_metric = if neighbor.capacity >= 100 {
-                        1
-                    } else if neighbor.capacity > 0 {
-                        (100 / neighbor.capacity.max(1)).min(15) as u32
-                    } else {
-                        INFINITE_METRIC
-                    };
-                    
                     let should_update = match existing_entry {
-                        Some((current_next_hop, RouteState::Active(current_metric))) => {
-                            neighbor_metric + 1 < *current_metric
-                        },
-                        Some((_, RouteState::Unreachable)) => true,
                         None => true,
+                        Some((_, RouteState::Unreachable)) => true,
+                        Some((_, RouteState::Active(metric))) => *metric > 1,
                     };
                     
                     if should_update {
-                        routing_table.insert(network_str.clone(), 
-                                            (next_hop.clone(), RouteState::Active(neighbor_metric + 1)));
-                        info!("Updated route to network: {} -> next_hop: {} (metric: {})", 
-                              network_str, next_hop, neighbor_metric + 1);
-                        
+                        routing_table.insert(network_str.clone(), (next_hop.clone(), RouteState::Active(1)));
                         if let Err(e) = update_routing_table_safe(&network_str, &next_hop).await {
                             warn!("Could not update system routing table for {}: {}", network_str, e);
                         }
@@ -851,33 +782,24 @@ async fn update_routing_from_lsa(
                 }
             }
         } else {
-            // Gérer les voisins inactifs (lien DOWN)
+            // Gérer les voisins inactifs
             info!("Processing link DOWN for neighbor {} via {}", neighbor.neighbor_ip, sender_ip);
-            
-            // Chercher toutes les routes qui passent par ce next_hop
             let mut routes_to_update = Vec::new();
-            
-            for (dest, (next_hop, _)) in routing_table.iter() {
-                // Si nous utilisions ce voisin comme next_hop pour cette route
-                if next_hop == sender_ip {
+            for (dest, (nh, _)) in routing_table.iter() {
+                if nh == sender_ip {
                     routes_to_update.push(dest.clone());
                 }
             }
-            
-            // Marquer ces routes comme inaccessibles ou les supprimer
             for dest in routes_to_update {
-                info!("Marking route to {} via {} as unreachable (link DOWN)", dest, sender_ip);
+                info!("Marking route to {} as unreachable (link DOWN)", dest);
                 routing_table.insert(dest.clone(), (sender_ip.to_string(), RouteState::Unreachable));
-                
-                // Essayer de supprimer cette route du système
                 let handle = match Handle::new() {
                     Ok(h) => h,
                     Err(e) => {
-                        warn!("Cannot create routing handle: {}", e);
+                        warn!("Cannot create routing handle (permissions?): {}", e);
                         continue;
                     }
                 };
-                
                 let (destination_ip, prefix) = if dest.contains('/') {
                     match dest.parse::<IpNetwork>() {
                         Ok(network) => (network.ip(), network.prefix()),
@@ -889,54 +811,64 @@ async fn update_routing_from_lsa(
                         Err(_) => continue,
                     }
                 };
-                
                 let route = Route::new(destination_ip, prefix);
                 if let Err(e) = handle.delete(&route).await {
                     debug!("Failed to remove route {} from system table: {}", dest, e);
                 } else {
-                    info!("Removed unreachable route {} from system table", dest);
+                    debug!("Removed route {} from system table", dest);
                 }
             }
-            
-            // Relancer SPF pour trouver des chemins alternatifs si possible
             if let Err(e) = run_spf_algorithm(&state).await {
                 error!("Failed to run SPF algorithm after link DOWN: {}", e);
             }
         }
     }
-    
-    // Traiter la table de routage de la LSA
+
+    // Mettre à jour la table de routage en se basant sur la routing_table de la LSA
     for (dest, route_state) in &lsa.routing_table {
         if dest == &state.local_ip {
-            continue; // Ne pas ajouter de route vers soi-même
+            continue;
         }
-        
         match route_state {
             RouteState::Active(metric) => {
                 let existing_entry = routing_table.get(dest);
-                let new_metric = metric + 1; // Ajouter 1 à la métrique
-                
+                let new_metric = metric + 1;
                 let should_update = match existing_entry {
+                    None => true,
+                    Some((_, RouteState::Unreachable)) => true,
                     Some((_, RouteState::Active(current_metric))) => new_metric < *current_metric,
-                    Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
-                    None => true, // Ajouter une nouvelle route
                 };
-                
                 if should_update {
                     routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                    info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
-                    
                     if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
                         warn!("Could not update system routing table for {}: {}", dest, e);
                     }
                 }
-            },
+            }
             RouteState::Unreachable => {
-                // Marquer cette route comme inaccessible si elle passe par le même next_hop
                 if let Some((current_next_hop, _)) = routing_table.get(dest) {
-                    if current_next_hop == &next_hop {
-                        routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Unreachable));
-                        info!("Route marked as unreachable: {}", dest);
+                    if current_next_hop == sender_ip {
+                        routing_table.insert(dest.clone(), (sender_ip.to_string(), RouteState::Unreachable));
+                        let handle = match Handle::new() {
+                            Ok(h) => h,
+                            Err(e) => {
+                                warn!("Cannot create routing handle: {}", e);
+                                continue;
+                            }
+                        };
+                        let (destination_ip, prefix) = if dest.contains('/') {
+                            match dest.parse::<IpNetwork>() {
+                                Ok(network) => (network.ip(), network.prefix()),
+                                Err(_) => continue,
+                            }
+                        } else {
+                            match dest.parse::<IpAddr>() {
+                                Ok(ip) => (ip, 32),
+                                Err(_) => continue,
+                            }
+                        };
+                        let route = Route::new(destination_ip, prefix);
+                        let _ = handle.delete(&route).await;
                     }
                 }
             }
@@ -979,13 +911,11 @@ async fn send_poisoned_route(
 
 /// Version sécurisée pour mettre à jour la table de routage système
 async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
-    // Ignorer les routes avec gateway 0.0.0.0 immédiatement
     if gateway == "0.0.0.0" {
         debug!("Skipping connected route: {}", destination);
         return Ok(());
     }
 
-    // Analyser la destination, qui peut être une IP ou un CIDR
     let (destination_ip, prefix) = if destination.contains('/') {
         match destination.parse::<IpNetwork>() {
             Ok(network) => (network.ip(), network.prefix()),
@@ -998,13 +928,11 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         }
     };
 
-    // Analyser la gateway
     let gateway_ip = match gateway.parse::<IpAddr>() {
         Ok(ip) => ip,
         Err(_) => return Err(AppError::RouteError("Invalid gateway IP".to_string())),
     };
 
-    // Vérifier si on a les permissions pour modifier la table de routage
     let handle = match Handle::new() {
         Ok(h) => h,
         Err(e) => {
@@ -1013,33 +941,23 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         }
     };
     
-    let route = Route::new(destination_ip, prefix)
-        .with_gateway(IpAddr::V4(gateway_ip));
+    let route = Route::new(destination_ip, prefix).with_gateway(gateway_ip);
 
-    // Essayer d'ajouter la route
     match handle.add(&route).await {
         Ok(_) => {
             info!("Successfully added route to {}/{} via {}", destination_ip, prefix, gateway_ip);
             Ok(())
         },
         Err(e) => {
-            // Si la route existe déjà, essayer de la modifier
             debug!("Route add failed: {}, trying to update", e);
-            
-            // Vérifier si la route existe avant d'essayer de la supprimer
             match handle.delete(&route).await {
                 Ok(_) => debug!("Successfully deleted existing route"),
                 Err(e) => debug!("No existing route to delete: {}", e),
             }
-            
             match handle.add(&route).await {
-                Ok(_) => {
-                    info!("Successfully updated route to {}/{} via {}", destination_ip, prefix, gateway_ip);
-                    Ok(())
-                },
+                Ok(_) => Ok(()),
                 Err(e2) => {
-                    warn!("Failed to add/update route to {}/{} via {}: {}", destination_ip, prefix, gateway_ip, e2);
-                    Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
+                    Err(AppError::RouteError(format!("Could not add or update route: {}", e2)))
                 }
             }
         }
@@ -1067,11 +985,7 @@ mod tests {
     
     #[test]
     fn test_calculate_broadcast_for_interface() {
-        // Créer un réseau de test
-        let ipv4_network = IpNetwork::V4(
-            "192.168.1.10/24".parse().unwrap()
-        );
-        
+        let ipv4_network = IpNetwork::V4("192.168.1.10/24".parse().unwrap());
         let result = calculate_broadcast_for_interface("192.168.1.10", &ipv4_network, 5000);
         assert!(result.is_ok());
         
@@ -1093,14 +1007,14 @@ mod tests {
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 
-// Structure pour représenter un lien dans le graphe
+/// Structure pour représenter un lien dans le graphe
 #[derive(Clone, Debug)]
 struct Link {
     to_router: String,
     metric: u32,
 }
 
-// Structure pour les éléments de la file de priorité de Dijkstra
+/// Structure pour les éléments de la file de priorité de Dijkstra
 #[derive(Clone, Debug, Eq)]
 struct DijkstraNode {
     router_id: String,
@@ -1110,7 +1024,6 @@ struct DijkstraNode {
 
 impl Ord for DijkstraNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Inverser l'ordre pour que la file de priorité soit un min-heap
         other.cost.cmp(&self.cost)
     }
 }
@@ -1127,7 +1040,7 @@ impl PartialEq for DijkstraNode {
     }
 }
 
-// Fonction pour exécuter l'algorithme Dijkstra et mettre à jour la table de routage
+/// Fonction pour exécuter l'algorithme Dijkstra et mettre à jour la table de routage
 async fn run_spf_algorithm(state: &Arc<AppState>) -> Result<()> {
     info!("Running SPF algorithm to recalculate routes");
     
@@ -1137,10 +1050,8 @@ async fn run_spf_algorithm(state: &Arc<AppState>) -> Result<()> {
     // Construire le graphe à partir de la topologie
     for (router_id, router) in topology_guard.iter() {
         let mut links = Vec::new();
-        
         for neighbor in &router.neighbors {
             if neighbor.link_up {
-                // Calculer la métrique
                 let metric = if neighbor.capacity >= 100 {
                     1
                 } else if neighbor.capacity > 0 {
@@ -1148,21 +1059,18 @@ async fn run_spf_algorithm(state: &Arc<AppState>) -> Result<()> {
                 } else {
                     INFINITE_METRIC
                 };
-                
                 links.push(Link {
                     to_router: neighbor.neighbor_ip.clone(),
                     metric,
                 });
             }
         }
-        
         graph.insert(router_id.clone(), links);
     }
     
-    // Ajouter ce routeur local au graphe avec ses voisins
+    // Ajouter le routeur local au graphe
     let mut local_links = Vec::new();
     let neighbors_guard = state.neighbors.lock().await;
-    
     for (neighbor_ip, neighbor) in neighbors_guard.iter() {
         if neighbor.link_up {
             let metric = if neighbor.capacity >= 100 {
@@ -1172,86 +1080,67 @@ async fn run_spf_algorithm(state: &Arc<AppState>) -> Result<()> {
             } else {
                 INFINITE_METRIC
             };
-            
             local_links.push(Link {
                 to_router: neighbor_ip.clone(),
                 metric,
             });
         }
     }
-    
     graph.insert(state.router_id.clone(), local_links);
     drop(neighbors_guard);
     drop(topology_guard);
     
-    // Exécuter l'algorithme de Dijkstra
+    // Exécuter Dijkstra
     let mut distances = HashMap::new();
     let mut next_hops = HashMap::new();
     let mut pq = BinaryHeap::new();
     
-    // Commencer par ce routeur
     pq.push(DijkstraNode {
         router_id: state.router_id.clone(),
         cost: 0,
         next_hop: None,
     });
-    
     distances.insert(state.router_id.clone(), 0);
     
     while let Some(DijkstraNode { router_id, cost, next_hop }) = pq.pop() {
-        // Si nous avons déjà trouvé un chemin plus court
         if let Some(&dist) = distances.get(&router_id) {
             if cost > dist {
                 continue;
             }
         }
-        
-        // Pour le premier saut depuis la source, le next_hop devient l'ID du routeur voisin
-        let real_next_hop = next_hop.clone().unwrap_or(router_id.clone());
-        
-        // Enregistrer le next_hop pour ce routeur
+        let real_next_hop = next_hop.clone().unwrap_or_else(|| router_id.clone());
         if router_id != state.router_id {
             next_hops.insert(router_id.clone(), real_next_hop.clone());
         }
-        
-        // Explorer les voisins
         if let Some(links) = graph.get(&router_id) {
             for link in links {
                 let new_cost = cost + link.metric;
-                
-                // Si nous avons trouvé un chemin plus court vers ce voisin
                 let is_better_path = match distances.get(&link.to_router) {
-                    Some(&current_cost) => new_cost < current_cost,
+                    Some(&old_cost) => new_cost < old_cost,
                     None => true,
                 };
-                
                 if is_better_path {
                     distances.insert(link.to_router.clone(), new_cost);
-                    
-                    // Le first_hop reste le même pour tous les nœuds dans le chemin
-                    let next_hop_to_use = if router_id == state.router_id {
+                    let nh = if router_id == state.router_id {
                         Some(link.to_router.clone())
                     } else {
-                        next_hop.clone()
+                        Some(real_next_hop.clone())
                     };
-                    
                     pq.push(DijkstraNode {
                         router_id: link.to_router.clone(),
                         cost: new_cost,
-                        next_hop: next_hop_to_use,
+                        next_hop: nh,
                     });
                 }
             }
         }
     }
     
-    // Mettre à jour la table de routage avec les résultats de Dijkstra
     update_routing_table_from_spf(state, &distances, &next_hops).await?;
-    
     Ok(())
 }
 
-// Mettre à jour la table de routage à partir des résultats de l'algorithme SPF
+/// Met à jour la table de routage à partir des résultats de l'algorithme SPF
 async fn update_routing_table_from_spf(
     state: &Arc<AppState>,
     distances: &HashMap<String, u32>,
@@ -1259,53 +1148,47 @@ async fn update_routing_table_from_spf(
 ) -> Result<()> {
     let mut routing_table = state.routing_table.lock().await;
     
-    // Collecter les réseaux annoncés par chaque routeur
+    // Conserver seulement les routes directement connectées
+    let connected_routes: Vec<String> = routing_table.iter()
+        .filter(|(_, (nh, st))| nh == "0.0.0.0" && matches!(st, RouteState::Active(_)))
+        .map(|(dest, _)| dest.clone())
+        .collect();
+    routing_table.clear();
+    
+    // Restaurer les routes connectées
+    for route in &connected_routes {
+        routing_table.insert(route.clone(), ("0.0.0.0".to_string(), RouteState::Active(0)));
+    }
+    
+    // Récupérer tous les réseaux annoncés
     let topology_guard = state.topology.lock().await;
     let mut router_networks = HashMap::new();
-    
     for (router_id, router) in topology_guard.iter() {
-        // Chercher les réseaux annoncés par ce routeur
         if let Ok(ip) = router_id.parse::<IpAddr>() {
-            if let Some(networks) = get_all_networks_for_router(router) {
-                for network in networks {
-                    router_networks.insert(network.to_string(), (router_id.clone(), ip));
+            if let Some((_, network)) = get_network_for_ip_improved(&ip) {
+                router_networks.insert(network.to_string(), (router_id.clone(), 0));
+            }
+        }
+        for neighbor in &router.neighbors {
+            if neighbor.link_up {
+                if let Ok(ip) = neighbor.neighbor_ip.parse::<IpAddr>() {
+                    if let Some((_, network)) = get_network_for_ip_improved(&ip) {
+                        router_networks.insert(network.to_string(), (router_id.clone(), 0));
+                    }
                 }
             }
         }
     }
     drop(topology_guard);
     
-    // Nettoyer la table de routage (conserver uniquement les routes directement connectées)
-    let connected_routes: Vec<String> = routing_table.iter()
-        .filter(|(_, (next_hop, state))| next_hop == "0.0.0.0" && matches!(state, RouteState::Active(_)))
-        .map(|(dest, _)| dest.clone())
-        .collect();
-    
-    routing_table.clear();
-    
-    // Restaurer les routes directement connectées
-    for route in connected_routes {
-        routing_table.insert(route, ("0.0.0.0".to_string(), RouteState::Active(0)));
-    }
-    
-    // Ajouter les routes calculées par SPF
+    // Ajouter les routes calculées
     for (network, (router_id, _)) in router_networks {
-        if let Some(next_hop) = next_hops.get(router_id) {
-            if let Some(&distance) = distances.get(router_id) {
-                // Obtenir l'adresse IP du next_hop
-                if let Ok(next_hop_ip) = get_ip_for_router_id(state, next_hop).await {
-                    routing_table.insert(
-                        network.clone(),
-                        (next_hop_ip.clone(), RouteState::Active(distance))
-                    );
-                    
-                    // Mettre à jour la table de routage du système
-                    if let Err(e) = update_routing_table_safe(&network, &next_hop_ip).await {
-                        warn!("Failed to update system routing table for {}: {}", network, e);
-                    } else {
-                        info!("Updated route: {} -> next_hop: {} (metric: {})", 
-                             network, next_hop_ip, distance);
-                    }
+        if let Some(cost) = distances.get(&router_id) {
+            if let Some(nh_router) = next_hops.get(&router_id) {
+                if let Ok(nh_ip) = get_ip_for_router_id(state, nh_router).await {
+                    let metric = *cost;
+                    routing_table.insert(network.clone(), (nh_ip.clone(), RouteState::Active(metric)));
+                    let _ = update_routing_table_safe(&network, &nh_ip).await;
                 }
             }
         }
@@ -1314,18 +1197,14 @@ async fn update_routing_table_from_spf(
     Ok(())
 }
 
-// Nouvelle fonction pour obtenir tous les réseaux annoncés par un routeur
+/// Obtenir tous les réseaux connus d'un routeur (exemple minimal)
 fn get_all_networks_for_router(router: &Router) -> Option<Vec<IpNetwork>> {
     let mut networks = Vec::new();
-    
-    // Ajouter le réseau principal du routeur
     if let Ok(ip) = router.router_ip.parse::<IpAddr>() {
         if let Some((_, network)) = get_network_for_ip_improved(&ip) {
             networks.push(network);
         }
     }
-    
-    // Ajouter les réseaux des voisins
     for neighbor in &router.neighbors {
         if neighbor.link_up {
             if let Ok(ip) = neighbor.neighbor_ip.parse::<IpAddr>() {
@@ -1337,7 +1216,6 @@ fn get_all_networks_for_router(router: &Router) -> Option<Vec<IpNetwork>> {
             }
         }
     }
-    
     if networks.is_empty() {
         None
     } else {
