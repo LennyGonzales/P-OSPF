@@ -134,6 +134,21 @@ struct AppState {
     routing_table: Mutex<HashMap<String, (String, RouteState)>>, // (next_hop, état)
     processed_lsa: Mutex<HashSet<(String, u32)>>, // (originator, seq_num) pour éviter de traiter plusieurs fois
     local_ip: String,
+    enabled: Mutex<bool>, // Ajouté pour activer/désactiver le protocole
+}
+
+impl AppState {
+    async fn enable(&self) {
+        let mut enabled = self.enabled.lock().await;
+        *enabled = true;
+    }
+    async fn disable(&self) {
+        let mut enabled = self.enabled.lock().await;
+        *enabled = false;
+    }
+    async fn is_enabled(&self) -> bool {
+        *self.enabled.lock().await
+    }
 }
 
 /// Récupère toutes les adresses de broadcast avec leurs interfaces locales associées
@@ -203,6 +218,7 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         routing_table: Mutex::new(HashMap::new()),
         processed_lsa: Mutex::new(HashSet::new()),
         local_ip: router_ip.clone(),
+        enabled: Mutex::new(true), // Protocole activé par défaut
     });
 
     // Ajouter les réseaux directs (interfaces locales) à la table de routage
@@ -250,6 +266,9 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         loop {
             tokio::select! {
                 _ = hello_interval.tick() => {
+                    if !state_clone.is_enabled().await {
+                        continue;
+                    }
                     let broadcast_addrs = get_broadcast_addresses(PORT);
                     for (local_ip, addr) in &broadcast_addrs {
                         if let Err(e) = send_hello(&socket_clone, addr, local_ip).await {
@@ -258,6 +277,9 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
                     }
                 }
                 _ = lsa_interval.tick() => {
+                    if !state_clone.is_enabled().await {
+                        continue;
+                    }
                     let broadcast_addrs = get_broadcast_addresses(PORT);
                     for (local_ip, addr) in &broadcast_addrs {
                         // Générer un numéro de séquence unique basé sur le timestamp
@@ -265,7 +287,6 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_else(|_| Duration::from_secs(0))
                             .as_secs() as u32;
-                            
                         if let Err(e) = send_lsa(&socket_clone, addr, local_ip, None, local_ip, Arc::clone(&state_clone), seq_num, vec![]).await {
                             error!("Failed to send LSA: {}", e);
                         }
@@ -409,6 +430,24 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
                                 } else {
                                     debug!("LSA TTL expired, not forwarding");
                                 }
+                            }
+                        }
+                        3 => {
+                            // Message de contrôle : enable/disable
+                            if let Some(command) = json.get("command").and_then(|v| v.as_str()) {
+                                match command {
+                                    "enable" => {
+                                        state.enable().await;
+                                        info!("Protocole activé via commande réseau");
+                                    },
+                                    "disable" => {
+                                        state.disable().await;
+                                        info!("Protocole désactivé via commande réseau");
+                                    },
+                                    _ => warn!("Commande de contrôle inconnue: {}", command),
+                                }
+                            } else {
+                                warn!("Message de contrôle sans champ 'command'");
                             }
                         }
                         _ => warn!("Unknown message type: {}", message_type),
