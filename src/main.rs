@@ -673,7 +673,7 @@ fn get_network_for_ip_improved(ip: &IpAddr) -> Option<(IpAddr, IpNetwork)> {
             for ip_network in &interface.ips {
                 if let IpNetwork::V4(network) = ip_network {
                     if network.contains(*ipv4) {
-                        return Some((*ip, *network));
+                        return Some((*ip, *ip_network));
                     }
                 }
             }
@@ -697,13 +697,15 @@ fn get_network_for_ip_improved(ip: &IpAddr) -> Option<(IpAddr, IpNetwork)> {
             _ => [octets[0], octets[1], octets[2], 0],
         };
         
-        if let Ok(network) = IpNetwork::new(
-            IpAddr::V4(Ipv4Addr::new(
-                network_octets[0], network_octets[1], network_octets[2], network_octets[3]
-            )),
-            prefix,
-        ) {
-            return Some((*ip, network));
+        // Création d'une adresse IP réseau
+        let network_addr = Ipv4Addr::new(
+            network_octets[0], network_octets[1], network_octets[2], network_octets[3]
+        );
+        
+        // Création d'un IpNetwork
+        match IpNetwork::new(IpAddr::V4(network_addr), prefix) {
+            Ok(network) => return Some((*ip, network)),
+            Err(_) => return None,
         }
     }
     None
