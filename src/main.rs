@@ -205,6 +205,24 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         local_ip: router_ip.clone(),
     });
 
+    // Ajouter les réseaux directs (interfaces locales) à la table de routage
+    {
+        let mut routing_table = state.routing_table.lock().await;
+        let interfaces = pnet::datalink::interfaces();
+        for iface in interfaces {
+            for ip_network in iface.ips {
+                if let IpAddr::V4(ipv4) = ip_network.ip() {
+                    if !ipv4.is_loopback() {
+                        routing_table.insert(
+                            ip_network.to_string(),
+                            ("-".to_string(), RouteState::Active(0)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Charger la configuration des interfaces et construire une map nom -> capacité
     let config_path = format!("src/conf/config_{}.toml", hostname::get().unwrap_or_default().to_string_lossy());
     let interface_config = match read_interfaces::read_interfaces_config(&config_path) {
