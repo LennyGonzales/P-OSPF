@@ -95,7 +95,7 @@ fn get_config_path() -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    format!("conf/config_{}.toml", hostname)
+    format!("src/conf/config_{}.toml", hostname)
 }
 
 #[tokio::main]
@@ -114,6 +114,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         routing_table: Mutex::new(HashMap::new()),
         sequence_number: Mutex::new(0),
     });
+
+    // Ajouter le routeur lui-même dans la topologie avec toutes ses interfaces détectées dynamiquement
+    {
+        let mut topology = state.topology.lock().await;
+        let interfaces = datalink::interfaces();
+        let neighbors: Vec<Neighbor> = interfaces.iter().flat_map(|iface| {
+            iface.ips.iter().filter_map(move |ip_network| {
+                if let IpAddr::V4(ipv4) = ip_network.ip() {
+                    if !ipv4.is_loopback() {
+                        Some(Neighbor {
+                            neighbor_ip: ipv4.to_string(),
+                            link_up: true,
+                            capacity: 100, // Valeur par défaut, ou à adapter si besoin
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        }).collect();
+        topology.insert(
+            router_ip.clone(),
+            Router {
+                router_ip: router_ip.clone(),
+                neighbors,
+            },
+        );
+    }
 
     let socket_clone = Arc::clone(&socket);
     tokio::spawn(async move {
