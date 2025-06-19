@@ -209,7 +209,7 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         for iface in datalink::interfaces() {
             for ip_network in iface.ips {
                 if let IpNetwork::V4(ipv4_network) = ip_network {
-                    if !ipv4_network.ip.is_loopback() && !ipv4_network.ip.is_unspecified() {
+                    if !ipv4_network.ip().is_loopback() && !ipv4_network.ip().is_unspecified() {
                         let network_addr_cidr = format!("{}/{}", ipv4_network.network(), ipv4_network.prefix());
                         // Route vers le réseau connecté, métrique 0, next_hop est "0.0.0.0" (connecté)
                         routing_table.insert(
