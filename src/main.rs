@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -7,6 +8,8 @@ use std::sync::Arc;
 use net_route::{Route, Handle};
 use pnet::datalink::{self, NetworkInterface};
 use log;
+
+mod read_interfaces;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HelloMessage {
@@ -81,10 +84,18 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<(), B
     Ok(())
 }
 
-fn get_next_sequence_number(state: Arc<AppState>) -> u32 {
+async fn get_next_sequence_number(state: Arc<AppState>) -> u32 {
     let mut seq = state.sequence_number.lock().await;
     *seq += 1;
     *seq
+}
+
+fn get_config_path() -> String {
+    let hostname = hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    format!("conf/config_{}.toml", hostname)
 }
 
 #[tokio::main]
@@ -138,6 +149,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    // Charger la configuration des interfaces et construire une map nom -> capacité
+    let config_path = get_config_path();
+    let interface_config = match read_interfaces::read_interfaces_config(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Erreur lors de la lecture de la config des interfaces: {}", e);
+            return Err(e);
+        }
+    };
+    let interface_capacities: std::collections::HashMap<String, u32> =
+        interface_config.interfaces.iter().map(|iface| (iface.name.clone(), iface.capacity_mbps)).collect();
+
+    // Afficher les interfaces lues depuis le fichier de configuration
+    println!("Interfaces chargées depuis {} :", config_path);
+    for iface in &interface_config.interfaces {
+        println!("- {} : {} Mbps", iface.name, iface.capacity_mbps);
+    }
+
     loop {
         let (len, src_addr) = socket.recv_from(&mut buf).await?;
         
@@ -161,12 +190,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     hello.router_ip, src_addr, receiving_interface_ip);
                                 
                                 let mut neighbors = state.neighbors.lock().await;
+                                let capacity = interface_capacities.get(&receiving_interface_ip)
+                                    .copied()
+                                    .unwrap_or(100);
                                 neighbors.insert(
                                     hello.router_ip.clone(),
                                     Neighbor {
                                         neighbor_ip: hello.router_ip.clone(),
                                         link_up: true,
-                                        capacity: 100,
+                                        capacity,
                                     },
                                 );
                                 drop(neighbors);
@@ -439,7 +471,7 @@ async fn update_routing_from_lsa(
     Ok(())
 }
 
-// Version sécurisée de update_routing_table avec meilleure gestion d'erreur
+/// Version sécurisée de update_routing_table avec meilleure gestion d'erreur
 async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Valider les adresses IP
     let destination_ip: Ipv4Addr = match destination.parse() {

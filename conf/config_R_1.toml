@@ -1,0 +1,7 @@
+[[interfaces]]
+name = "eth0"
+capacity_mbps = 1000
+
+[[interfaces]]
+name = "eth1"
+capacity_mbps = 100
