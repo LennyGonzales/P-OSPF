@@ -889,7 +889,7 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         if gateway_is_local { break; }
     }
     if !gateway_is_local {
-        warn!("[SYSTEM] Gateway {} n'est pas sur un réseau local, route ignorée.", gateway_ip);
+        warn!("[OSPF-LOGIC] Route OSPF logique ajoutée ({} via {}), mais NON ajoutée à la table système (gateway non locale)", dest_network, gateway_ip);
         return Ok(());
     }
     // Ajout effectif de la route système avec /24 via net_route
@@ -897,7 +897,7 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
     let dest_network = IpNetwork::V4(pnet::ipnetwork::Ipv4Network::new(dest_ip, 24).unwrap());
     let route = Route::new(dest_network.ip(), dest_network.prefix());
     handle.add(&route).await.map_err(|e| AppError::RouteError(format!("net_route add: {}", e)))?;
-    info!("[SYSTEM] Route ajoutée (net_route) : {}/{} via {}", dest_network.ip(), dest_network.prefix(), gateway_ip);
+    info!("[OSPF-SYSTEM] Route ajoutée dans la table système : {}/{} via {}", dest_network.ip(), dest_network.prefix(), gateway_ip);
     Ok(())
 }
 
