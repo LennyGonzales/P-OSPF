@@ -874,13 +874,15 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         return Ok(());
     }
 
+    // On force la destination à être un réseau /24 (192.168.x.0/24)
+    let dest_network = IpNetwork::V4(pnet::ipnetwork::Ipv4Network::new(dest_ip, 24).unwrap());
     // Vérifie que le gateway est sur un réseau local avant d'ajouter la route
     let interfaces = pnet::datalink::interfaces();
     let mut gateway_is_local = false;
-    for iface in interfaces {
-        for ip_network in iface.ips {
-            if let IpAddr::V4(local_ip) = ip_network.ip() {
-                if ip_network.contains(gateway_ip) {
+    for iface in &interfaces {
+        for ip_network in &iface.ips {
+            if let IpAddr::V4(_local_ip) = ip_network.ip() {
+                if ip_network.contains(IpAddr::V4(gateway_ip)) {
                     gateway_is_local = true;
                     break;
                 }
@@ -894,7 +896,6 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
     }
     // Ajout effectif de la route système avec /24 via net_route
     let handle = Handle::new().map_err(|e| AppError::RouteError(format!("net_route handle: {}", e)))?;
-    let dest_network = IpNetwork::V4(pnet::ipnetwork::Ipv4Network::new(dest_ip, 24).unwrap());
     let route = Route::new(dest_network.ip(), dest_network.prefix());
     handle.add(&route).await.map_err(|e| AppError::RouteError(format!("net_route add: {}", e)))?;
     info!("[OSPF-SYSTEM] Route ajoutée dans la table système : {}/{} via {}", dest_network.ip(), dest_network.prefix(), gateway_ip);
