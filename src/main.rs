@@ -851,17 +851,18 @@ async fn send_poisoned_route(
 
 /// Version sécurisée pour mettre à jour la table de routage système
 async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
-    // Si destination est une IP seule, on force le /24
-    let (dest_ip, prefix) = if let Ok(ipv4) = destination.parse::<std::net::Ipv4Addr>() {
-        (ipv4, 24)
+    // Toujours forcer le /24, que ce soit une IP ou un réseau
+    let dest_ip = if let Ok(ipv4) = destination.parse::<std::net::Ipv4Addr>() {
+        ipv4
     } else if let Ok(ipnet) = destination.parse::<IpNetwork>() {
         match ipnet {
-            IpNetwork::V4(net) => (net.network(), net.prefix()),
+            IpNetwork::V4(net) => net.network(),
             _ => return Err(AppError::RouteError("IPv6 non supporté".to_string())),
         }
     } else {
         return Err(AppError::RouteError(format!("Invalid destination: {}", destination)));
     };
+    let prefix = 24;
 
     let gateway_ip: std::net::Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
@@ -877,6 +878,12 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
     // Exemple (pseudo-code, à adapter selon ta logique):
     // net_route::add_route(dest_ip, prefix, gateway_ip)
     debug!("[SYSTEM] Would add route: {}/{} via {}", dest_ip, prefix, gateway_ip);
+
+    // Ajout effectif de la route système avec /24 via net_route
+    let handle = Handle::new().map_err(|e| AppError::RouteError(format!("net_route handle: {}", e)))?;
+    let route = Route::new(IpAddr::V4(dest_ip), prefix);
+    handle.add(&route).await.map_err(|e| AppError::RouteError(format!("net_route add: {}", e)))?;
+    info!("[SYSTEM] Route ajoutée (net_route) : {}/{} via {}", dest_ip, prefix, gateway_ip);
     Ok(())
 }
 
