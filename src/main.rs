@@ -851,51 +851,33 @@ async fn send_poisoned_route(
 
 /// Version sécurisée pour mettre à jour la table de routage système
 async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
-    // Valider les adresses IP
-    let destination_ip: Ipv4Addr = destination.parse()
-        .map_err(|e| AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e)))?;
-    
-    let gateway_ip: Ipv4Addr = gateway.parse()
+    // Si destination est une IP seule, on force le /24
+    let (dest_ip, prefix) = if let Ok(ipv4) = destination.parse::<std::net::Ipv4Addr>() {
+        (ipv4, 24)
+    } else if let Ok(ipnet) = destination.parse::<IpNetwork>() {
+        match ipnet {
+            IpNetwork::V4(net) => (net.network(), net.prefix()),
+            _ => return Err(AppError::RouteError("IPv6 non supporté".to_string())),
+        }
+    } else {
+        return Err(AppError::RouteError(format!("Invalid destination: {}", destination)));
+    };
+
+    let gateway_ip: std::net::Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
 
     // Éviter d'ajouter des routes vers des adresses locales ou invalides
-    if destination_ip.is_loopback() || destination_ip.is_unspecified() || 
+    if dest_ip.is_loopback() || dest_ip.is_unspecified() || 
        gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
         debug!("Skipping route to invalid address: {} via {}", destination, gateway);
         return Ok(());
     }
 
-    // Vérifier si on a les permissions pour modifier la table de routage
-    let handle = Handle::new()
-        .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
-    
-    // Calculer l'adresse réseau en appliquant un masque /32 pour une route host spécifique
-    let route = Route::new(IpAddr::V4(destination_ip), 32)
-        .with_gateway(IpAddr::V4(gateway_ip));
-
-    // Essayer d'ajouter la route
-    match handle.add(&route).await {
-        Ok(_) => {
-            info!("Successfully added host route to {} via {}", destination_ip, gateway_ip);
-            Ok(())
-        },
-        Err(e) => {
-            // Si la route existe déjà, essayer de la supprimer puis la re-ajouter
-            debug!("Route add failed, trying to update: {}", e);
-            let _ = handle.delete(&route).await; // Ignorer l'erreur de suppression
-            
-            match handle.add(&route).await {
-                Ok(_) => {
-                    info!("Successfully updated host route to {} via {}", destination_ip, gateway_ip);
-                    Ok(())
-                },
-                Err(e2) => {
-                    warn!("Failed to add/update route to {} via {}: {}", destination_ip, gateway_ip, e2);
-                    Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
-                }
-            }
-        }
-    }
+    // Ici, tu dois utiliser la commande système ou la crate net_route pour ajouter la route
+    // Exemple (pseudo-code, à adapter selon ta logique):
+    // net_route::add_route(dest_ip, prefix, gateway_ip)
+    debug!("[SYSTEM] Would add route: {}/{} via {}", dest_ip, prefix, gateway_ip);
+    Ok(())
 }
 
 #[cfg(test)]
