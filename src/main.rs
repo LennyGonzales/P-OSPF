@@ -874,14 +874,26 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         return Ok(());
     }
 
-    // Ici, tu dois utiliser la commande système ou la crate net_route pour ajouter la route
-    // Exemple (pseudo-code, à adapter selon ta logique):
-    // net_route::add_route(dest_ip, prefix, gateway_ip)
-    debug!("[SYSTEM] Would add route: {}/{} via {}", dest_ip, prefix, gateway_ip);
-
+    // Vérifie que le gateway est sur un réseau local avant d'ajouter la route
+    let interfaces = pnet::datalink::interfaces();
+    let mut gateway_is_local = false;
+    for iface in interfaces {
+        for ip_network in iface.ips {
+            if let IpAddr::V4(local_ip) = ip_network.ip() {
+                if ip_network.contains(gateway_ip) {
+                    gateway_is_local = true;
+                    break;
+                }
+            }
+        }
+        if gateway_is_local { break; }
+    }
+    if !gateway_is_local {
+        warn!("[SYSTEM] Gateway {} n'est pas sur un réseau local, route ignorée.", gateway_ip);
+        return Ok(());
+    }
     // Ajout effectif de la route système avec /24 via net_route
     let handle = Handle::new().map_err(|e| AppError::RouteError(format!("net_route handle: {}", e)))?;
-    // On force la destination à être un réseau /24 (192.168.x.0/24)
     let dest_network = IpNetwork::V4(pnet::ipnetwork::Ipv4Network::new(dest_ip, 24).unwrap());
     let route = Route::new(dest_network.ip(), dest_network.prefix());
     handle.add(&route).await.map_err(|e| AppError::RouteError(format!("net_route add: {}", e)))?;
