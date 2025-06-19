@@ -143,10 +143,11 @@ fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
         .into_iter()
         .flat_map(|iface: NetworkInterface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
-                if let IpAddr::V4(ip) = ip_network.ip() {
+                if let IpNetwork::V4(ipv4_network) = ip_network {
+                    let ip = ipv4_network.ip();
                     if !ip.is_loopback() {
                         // Calculer l'adresse de broadcast pour ce réseau
-                        let broadcast_addr = ip_network.broadcast();
+                        let broadcast_addr = ipv4_network.broadcast();
                         Some((
                             ip.to_string(),
                             SocketAddr::new(IpAddr::V4(broadcast_addr), port),
