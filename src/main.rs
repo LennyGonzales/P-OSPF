@@ -182,13 +182,17 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<()> {
 /// Point d'entrée principal du programme
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn StdError>> {
-    
+    // Configuration du logger
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-
     env_logger::init();
-
+    
+    // Vérifier les privilèges pour la manipulation de routes
+    if !cfg!(windows) && unsafe { libc::geteuid() } != 0 {
+        warn!("Not running as root/administrator - route manipulation may fail");
+    }
+    
     let router_ip = get_local_ip()?;
     info!("Router IP: {}", router_ip);
 
@@ -489,10 +493,12 @@ fn determine_receiving_interface(
         }
     }
 
-    // Si aucune interface correspondante n'est trouvée, utiliser la première IP locale non-loopback
+    // Si aucune correspondance directe n'est trouvée, utiliser l'interface par défaut
     for (local_ip, (local_ip_str, ip_network)) in local_ips {
         if let IpAddr::V4(ipv4) = local_ip {
             if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                warn!("Could not determine exact receiving interface for {}, using {} as default", 
+                     sender_ip, local_ip_str);
                 return Ok((local_ip_str.clone(), ip_network.clone()));
             }
         }
@@ -620,6 +626,12 @@ async fn update_routing_from_lsa(
     sender_ip: &str,
     socket: &UdpSocket
 ) -> Result<()> {
+    // Vérifier d'abord si le TTL est suffisant pour traiter cette LSA
+    if lsa.ttl == 0 {
+        debug!("Ignoring LSA with expired TTL");
+        return Ok(());
+    }
+
     let mut routing_table = state.routing_table.lock().await;
 
     // Définir next_hop pour cette LSA
@@ -664,7 +676,13 @@ async fn update_routing_from_lsa(
             }
             
             let existing_entry = routing_table.get(&neighbor.neighbor_ip);
-            let neighbor_metric = (100 / neighbor.capacity.max(1)) as u32; // Métrique inversement proportionnelle à la capacité
+            let neighbor_metric = if neighbor.capacity >= 100 {
+                1  // Métrique minimale pour les liens haute capacité
+            } else if neighbor.capacity > 0 {
+                (100 / neighbor.capacity.max(1)).min(15) as u32  // Limiter la métrique à 15 maximum
+            } else {
+                INFINITE_METRIC  // Pour éviter une division par zéro
+            };
             
             let should_update = match existing_entry {
                 Some((current_next_hop, RouteState::Active(current_metric))) => {
@@ -783,6 +801,12 @@ async fn send_poisoned_route(
 
 /// Version sécurisée pour mettre à jour la table de routage système
 async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
+    // Ignorer les routes avec gateway 0.0.0.0 immédiatement
+    if gateway == "0.0.0.0" {
+        debug!("Skipping connected route: {}", destination);
+        return Ok(());
+    }
+
     // Analyser la destination, qui peut être une IP ou un CIDR
     let (destination_ip, prefix) = if destination.contains('/') {
         let cidr: IpNetwork = match destination.parse() {
@@ -810,15 +834,14 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         return Ok(());
     }
 
-    // Ne pas ajouter de route si la passerelle est 0.0.0.0 (route connectée)
-    if gateway_ip.is_unspecified() {
-        debug!("Skipping connected route: {}", destination);
-        return Ok(());
-    }
-
     // Vérifier si on a les permissions pour modifier la table de routage
-    let handle = Handle::new()
-        .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
+    let handle = match Handle::new() {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Cannot create routing handle (permissions?): {}", e);
+            return Err(AppError::RouteError(format!("Cannot create routing handle: {}", e)));
+        }
+    };
     
     let route = Route::new(destination_ip, prefix)
         .with_gateway(IpAddr::V4(gateway_ip));
@@ -830,9 +853,14 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
             Ok(())
         },
         Err(e) => {
-            // Si la route existe déjà, essayer de la supprimer puis la re-ajouter
-            debug!("Route add failed, trying to update: {}", e);
-            let _ = handle.delete(&route).await; // Ignorer l'erreur de suppression
+            // Si la route existe déjà, essayer de la modifier
+            debug!("Route add failed: {}, trying to update", e);
+            
+            // Vérifier si la route existe avant d'essayer de la supprimer
+            match handle.delete(&route).await {
+                Ok(_) => debug!("Successfully deleted existing route"),
+                Err(e) => debug!("No existing route to delete: {}", e),
+            }
             
             match handle.add(&route).await {
                 Ok(_) => {
