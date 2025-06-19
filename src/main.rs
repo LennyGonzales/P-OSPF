@@ -203,6 +203,26 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
         local_ip: router_ip.clone(),
     });
 
+    // Ajout des routes directement connectées à la table de routage
+    {
+        let mut routing_table = state.routing_table.lock().await;
+        for iface in datalink::interfaces() {
+            for ip_network in iface.ips {
+                if let IpNetwork::V4(ipv4_network) = ip_network {
+                    if !ipv4_network.ip().is_loopback() && !ipv4_network.is_unspecified() {
+                        let network_addr_cidr = format!("{}/{}", ipv4_network.network(), ipv4_network.prefix());
+                        // Route vers le réseau connecté, métrique 0, next_hop est "0.0.0.0" (connecté)
+                        routing_table.insert(
+                            network_addr_cidr.clone(),
+                            ("0.0.0.0".to_string(), RouteState::Active(0))
+                        );
+                        info!("Added directly connected route: {} (metric 0)", network_addr_cidr);
+                    }
+                }
+            }
+        }
+    }
+
     // Tâche pour envoyer périodiquement des messages Hello
     let socket_clone = Arc::clone(&socket);
     let state_clone = Arc::clone(&state);
@@ -671,7 +691,7 @@ async fn update_routing_from_lsa(
             routing_table.insert(neighbor.neighbor_ip.clone(), 
                               (next_hop.clone(), RouteState::Unreachable));
             
-            // Annoncer cette route comme empoisonnée
+            // Annoncer cette route comme empoisonée
             let broadcast_addrs = get_broadcast_addresses(PORT);
             for (local_ip, addr) in &broadcast_addrs {
                 let seq_num = std::time::SystemTime::now()
@@ -763,10 +783,23 @@ async fn send_poisoned_route(
 
 /// Version sécurisée pour mettre à jour la table de routage système
 async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
-    // Valider les adresses IP
-    let destination_ip: Ipv4Addr = destination.parse()
-        .map_err(|e| AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e)))?;
-    
+    // Analyser la destination, qui peut être une IP ou un CIDR
+    let (destination_ip, prefix) = if destination.contains('/') {
+        let cidr: IpNetwork = match destination.parse() {
+            Ok(c) => c,
+            Err(e) => return Err(AppError::RouteError(format!("Invalid destination CIDR {}: {}", destination, e))),
+        };
+        (cidr.ip(), cidr.prefix())
+    } else {
+        // Si pas de masque, on suppose une route /32 vers un hôte
+        let ip: IpAddr = match destination.parse() {
+            Ok(i) => i,
+            Err(e) => return Err(AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e))),
+        };
+        (ip, 32)
+    };
+
+    // Valider l'adresse de la passerelle
     let gateway_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
 
@@ -777,18 +810,23 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         return Ok(());
     }
 
+    // Ne pas ajouter de route si la passerelle est 0.0.0.0 (route connectée)
+    if gateway_ip.is_unspecified() {
+        debug!("Skipping connected route: {}", destination);
+        return Ok(());
+    }
+
     // Vérifier si on a les permissions pour modifier la table de routage
     let handle = Handle::new()
         .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
     
-    // Calculer l'adresse réseau en appliquant un masque /32 pour une route host spécifique
-    let route = Route::new(IpAddr::V4(destination_ip), 32)
+    let route = Route::new(destination_ip, prefix)
         .with_gateway(IpAddr::V4(gateway_ip));
 
     // Essayer d'ajouter la route
     match handle.add(&route).await {
         Ok(_) => {
-            info!("Successfully added host route to {} via {}", destination_ip, gateway_ip);
+            info!("Successfully added route to {}/{} via {}", destination_ip, prefix, gateway_ip);
             Ok(())
         },
         Err(e) => {
@@ -798,11 +836,11 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
             
             match handle.add(&route).await {
                 Ok(_) => {
-                    info!("Successfully updated host route to {} via {}", destination_ip, gateway_ip);
+                    info!("Successfully updated route to {}/{} via {}", destination_ip, prefix, gateway_ip);
                     Ok(())
                 },
                 Err(e2) => {
-                    warn!("Failed to add/update route to {} via {}: {}", destination_ip, gateway_ip, e2);
+                    warn!("Failed to add/update route to {}/{} via {}: {}", destination_ip, prefix, gateway_ip, e2);
                     Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
                 }
             }
