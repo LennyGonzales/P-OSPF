@@ -593,6 +593,24 @@ fn get_local_ip() -> Result<String> {
     Err(AppError::ConfigError("No valid IP address found".to_string()))
 }
 
+/// Convertit une IP en adresse réseau (CIDR)
+fn ip_to_network(ip: &str, prefix: u8) -> Result<String> {
+    let ip: Ipv4Addr = ip.parse()
+        .map_err(|e| AppError::RouteError(format!("Invalid IP {}: {}", ip, e)))?;
+    
+    // Calculer le masque et l'adresse réseau
+    let mask = (!0u32) << (32 - prefix);
+    let network = u32::from(ip) & mask;
+    
+    // Formater l'adresse réseau avec le préfixe
+    Ok(format!("{}.{}.{}.{}/{}",
+        (network >> 24) & 0xFF,
+        (network >> 16) & 0xFF,
+        (network >> 8) & 0xFF,
+        network & 0xFF,
+        prefix))
+}
+
 /// Met à jour la table de routage en fonction des informations d'un message LSA
 async fn update_routing_from_lsa(
     state: Arc<AppState>,
@@ -601,127 +619,140 @@ async fn update_routing_from_lsa(
     socket: &UdpSocket
 ) -> Result<()> {
     let mut routing_table = state.routing_table.lock().await;
-
-    // Définir next_hop pour cette LSA
     let next_hop = sender_ip.to_string();
-
-    // Éviter d'ajouter une route vers soi-même
+    let prefix = 24; // Préfixe standard pour un réseau local
+    
+    // Traiter l'originator
     if lsa.originator != state.local_ip {
-        let existing_entry = routing_table.get(&lsa.originator);
-        let should_update = match existing_entry {
-            Some((current_next_hop, RouteState::Active(current_metric))) => {
-                // Si la route existe, mettre à jour si la nouvelle métrique est meilleure
-                match lsa.routing_table.get(&lsa.originator) {
-                    Some(RouteState::Active(new_metric)) => new_metric < current_metric,
-                    _ => false,
-                }
-            },
-            Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
-            None => true, // Ajouter une nouvelle route
-        };
-        
-        if should_update {
-            // Déterminer la métrique à utiliser
-            let metric = match lsa.routing_table.get(&lsa.originator) {
-                Some(RouteState::Active(m)) => *m + 1, // Ajouter 1 à la métrique
-                _ => 1, // Métrique par défaut pour une connexion directe
-            };
-            
-            routing_table.insert(lsa.originator.clone(), (next_hop.clone(), RouteState::Active(metric)));
-            info!("Updated route: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
-
-            // Exemple : mise à jour de la route pour l'originator
-            if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop, 24).await {
-                warn!("Could not update system routing table for {}: {}", lsa.originator, e);
-            }
-        }
-    }
-
-    // Mettre à jour les routes vers tous les voisins mentionnés dans la LSA
-    for neighbor in &lsa.neighbors {
-        if neighbor.link_up {
-            if neighbor.neighbor_ip == state.local_ip {
-                continue; // Ne pas ajouter de route vers soi-même
-            }
-            
-            let existing_entry = routing_table.get(&neighbor.neighbor_ip);
-            let neighbor_metric = (100 / neighbor.capacity.max(1)) as u32; // Métrique inversement proportionnelle à la capacité
-            
+        // Convertir l'IP de l'originator en adresse réseau
+        if let Ok(originator_network) = ip_to_network(&lsa.originator, prefix) {
+            // Vérifier si on a déjà une route pour ce réseau
+            let existing_entry = routing_table.get(&originator_network);
             let should_update = match existing_entry {
-                Some((current_next_hop, RouteState::Active(current_metric))) => {
-                    // Si la route existe, mettre à jour si la nouvelle métrique est meilleure
-                    neighbor_metric + 1 < *current_metric
+                Some((_, RouteState::Active(current_metric))) => {
+                    // Vérifier si la nouvelle métrique est meilleure
+                    match lsa.routing_table.get(&originator_network) {
+                        Some(RouteState::Active(new_metric)) => new_metric < current_metric,
+                        _ => false,
+                    }
                 },
-                Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
-                None => true, // Ajouter une nouvelle route
+                Some((_, RouteState::Unreachable)) => true,
+                None => true,
             };
             
             if should_update {
-                routing_table.insert(neighbor.neighbor_ip.clone(), 
-                                  (next_hop.clone(), RouteState::Active(neighbor_metric + 1)));
-                info!("Updated route: {} -> next_hop: {} (metric: {})", 
-                      neighbor.neighbor_ip, next_hop, neighbor_metric + 1);
+                // Déterminer la métrique
+                let metric = match lsa.routing_table.get(&originator_network) {
+                    Some(RouteState::Active(m)) => *m + 1,
+                    _ => 1,
+                };
                 
-                if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop, 24).await {
-                    warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
-                }
-            }
-        } else if routing_table.contains_key(&neighbor.neighbor_ip) {
-            // Le voisin est marqué comme inaccessible
-            info!("Route poisoning: {} -> unreachable", neighbor.neighbor_ip);
-            routing_table.insert(neighbor.neighbor_ip.clone(), 
-                              (next_hop.clone(), RouteState::Unreachable));
-            
-            // Annoncer cette route comme empoisonnée
-            let broadcast_addrs = get_broadcast_addresses(PORT);
-            for (local_ip, addr) in &broadcast_addrs {
-                let seq_num = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_else(|_| Duration::from_secs(0))
-                    .as_secs() as u32;
-                    
-                let path = vec![state.local_ip.clone()];
+                // Mettre à jour la table de routage interne
+                routing_table.insert(originator_network.clone(), (next_hop.clone(), RouteState::Active(metric)));
+                info!("Updated route: {} -> next_hop: {} (metric: {})", originator_network, next_hop, metric);
                 
-                if let Err(e) = send_poisoned_route(socket, addr, local_ip, &neighbor.neighbor_ip, 
-                                                  seq_num, path).await {
-                    error!("Failed to send poisoned route: {}", e);
+                // Mettre à jour la table de routage système
+                if let Err(e) = update_routing_table_safe(&originator_network, &next_hop, prefix).await {
+                    warn!("Could not update system routing table for {}: {}", originator_network, e);
                 }
             }
         }
     }
-
-    // Traiter la table de routage de la LSA
+    
+    // Mettre à jour les routes vers les voisins
+    for neighbor in &lsa.neighbors {
+        if neighbor.link_up && neighbor.neighbor_ip != state.local_ip {
+            if let Ok(neighbor_network) = ip_to_network(&neighbor.neighbor_ip, prefix) {
+                let existing_entry = routing_table.get(&neighbor_network);
+                let neighbor_metric = (100 / neighbor.capacity.max(1)) as u32;
+                
+                let should_update = match existing_entry {
+                    Some((_, RouteState::Active(current_metric))) => neighbor_metric + 1 < *current_metric,
+                    Some((_, RouteState::Unreachable)) => true,
+                    None => true,
+                };
+                
+                if should_update {
+                    routing_table.insert(neighbor_network.clone(), 
+                                     (next_hop.clone(), RouteState::Active(neighbor_metric + 1)));
+                    info!("Updated route: {} -> next_hop: {} (metric: {})", 
+                         neighbor_network, next_hop, neighbor_metric + 1);
+                    
+                    if let Err(e) = update_routing_table_safe(&neighbor_network, &next_hop, prefix).await {
+                        warn!("Could not update system routing table for {}: {}", neighbor_network, e);
+                    }
+                }
+            }
+        } else if !neighbor.link_up {
+            if let Ok(neighbor_network) = ip_to_network(&neighbor.neighbor_ip, prefix) {
+                if routing_table.contains_key(&neighbor_network) {
+                    info!("Route poisoning: {} -> unreachable", neighbor_network);
+                    routing_table.insert(neighbor_network.clone(), (next_hop.clone(), RouteState::Unreachable));
+                    
+                    // Annoncer cette route comme empoisonnée
+                    let broadcast_addrs = get_broadcast_addresses(PORT);
+                    for (local_ip, addr) in &broadcast_addrs {
+                        let seq_num = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_else(|_| Duration::from_secs(0))
+                            .as_secs() as u32;
+                            
+                        let path = vec![state.local_ip.clone()];
+                        
+                        if let Err(e) = send_poisoned_route(socket, addr, local_ip, &neighbor.neighbor_ip, 
+                                                          seq_num, path).await {
+                            error!("Failed to send poisoned route: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Traiter la table de routage du LSA
     for (dest, route_state) in &lsa.routing_table {
-        if dest == &state.local_ip {
-            continue; // Ne pas ajouter de route vers soi-même
+        // Vérifier si c'est déjà une adresse réseau (avec un '/')
+        let dest_network = if dest.contains('/') {
+            dest.clone()
+        } else if let Ok(network) = ip_to_network(dest, prefix) {
+            network
+        } else {
+            continue; // Ignorer les destinations invalides
+        };
+        
+        // Ne pas ajouter de route vers notre propre réseau
+        if let Ok(local_network) = ip_to_network(&state.local_ip, prefix) {
+            if dest_network == local_network {
+                continue;
+            }
         }
         
         match route_state {
             RouteState::Active(metric) => {
-                let existing_entry = routing_table.get(dest);
-                let new_metric = metric + 1; // Ajouter 1 à la métrique
+                let existing_entry = routing_table.get(&dest_network);
+                let new_metric = metric + 1;
                 
                 let should_update = match existing_entry {
                     Some((_, RouteState::Active(current_metric))) => new_metric < *current_metric,
-                    Some((_, RouteState::Unreachable)) => true, // Toujours mettre à jour une route marquée inaccessible
-                    None => true, // Ajouter une nouvelle route
+                    Some((_, RouteState::Unreachable)) => true,
+                    None => true,
                 };
                 
                 if should_update {
-                    routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                    info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
+                    routing_table.insert(dest_network.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
+                    info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", 
+                         dest_network, next_hop, new_metric);
                     
-                    if let Err(e) = update_routing_table_safe(dest, &next_hop, 24).await {
-                        warn!("Could not update system routing table for {}: {}", dest, e);
+                    if let Err(e) = update_routing_table_safe(&dest_network, &next_hop, prefix).await {
+                        warn!("Could not update system routing table for {}: {}", dest_network, e);
                     }
                 }
             },
             RouteState::Unreachable => {
-                // Marquer cette route comme inaccessible si elle passe par le même next_hop
-                if let Some((current_next_hop, _)) = routing_table.get(dest) {
+                if let Some((current_next_hop, _)) = routing_table.get(&dest_network) {
                     if current_next_hop == &next_hop {
-                        routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Unreachable));
-                        info!("Route marked as unreachable: {}", dest);
+                        routing_table.insert(dest_network.clone(), (next_hop.clone(), RouteState::Unreachable));
+                        info!("Route marked as unreachable: {}", dest_network);
                     }
                 }
             }
@@ -764,45 +795,59 @@ async fn send_poisoned_route(
 
 /// Version modifiée pour mettre à jour la table de routage système avec un préfixe
 async fn update_routing_table_safe(destination: &str, gateway: &str, prefix: u8) -> Result<()> {
-    // Valider les adresses IP
-    let destination_ip: Ipv4Addr = destination.parse()
-        .map_err(|e| AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e)))?;
+    // Vérifier si la destination contient déjà un préfixe (format CIDR)
+    let (destination_ip, actual_prefix) = if destination.contains('/') {
+        let parts: Vec<&str> = destination.split('/').collect();
+        if parts.len() == 2 {
+            let ip = parts[0].parse::<Ipv4Addr>()
+                .map_err(|e| AppError::RouteError(format!("Invalid destination IP {}: {}", parts[0], e)))?;
+            let net_prefix = parts[1].parse::<u8>()
+                .map_err(|e| AppError::RouteError(format!("Invalid prefix {}: {}", parts[1], e)))?;
+            (ip, net_prefix)
+        } else {
+            return Err(AppError::RouteError(format!("Invalid CIDR format: {}", destination)));
+        }
+    } else {
+        // C'est une adresse IP simple, utiliser le préfixe fourni
+        let ip = destination.parse::<Ipv4Addr>()
+            .map_err(|e| AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e)))?;
+        (ip, prefix)
+    };
+
     let gateway_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
 
-    // Éviter d'ajouter des routes vers des adresses locales ou invalides
+    // Éviter les adresses invalides
     if destination_ip.is_loopback() || destination_ip.is_unspecified() || 
        gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
         debug!("Skipping route to invalid address: {} via {}", destination, gateway);
         return Ok(());
     }
 
-    // Vérifier si on a les permissions pour modifier la table de routage
+    // Créer la route avec le bon préfixe
     let handle = Handle::new()
-        .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
+        .map_err(|e| AppError::RouteError(format!("Cannot create routing handle: {}", e)))?;
     
-    // Calculer l'adresse réseau en appliquant un masque /32 pour une route host spécifique
-    let route = Route::new(IpAddr::V4(destination_ip), prefix)
+    let route = Route::new(IpAddr::V4(destination_ip), actual_prefix)
         .with_gateway(IpAddr::V4(gateway_ip));
 
-    // Essayer d'ajouter la route
+    // Essayer d'ajouter ou mettre à jour la route
     match handle.add(&route).await {
         Ok(_) => {
-            info!("Successfully added host route to {} via {}", destination_ip, gateway_ip);
+            info!("Added route to {}/{} via {}", destination_ip, actual_prefix, gateway_ip);
             Ok(())
         },
         Err(e) => {
-            // Si la route existe déjà, essayer de la supprimer puis la re-ajouter
             debug!("Route add failed, trying to update: {}", e);
-            let _ = handle.delete(&route).await; // Ignorer l'erreur de suppression
+            let _ = handle.delete(&route).await;
             
             match handle.add(&route).await {
                 Ok(_) => {
-                    info!("Successfully updated host route to {} via {}", destination_ip, gateway_ip);
+                    info!("Updated route to {}/{} via {}", destination_ip, actual_prefix, gateway_ip);
                     Ok(())
                 },
                 Err(e2) => {
-                    warn!("Failed to add/update route to {} via {}: {}", destination_ip, gateway_ip, e2);
+                    warn!("Failed to add/update route: {}", e2);
                     Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
                 }
             }
