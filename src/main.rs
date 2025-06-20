@@ -637,14 +637,16 @@ async fn update_routing_from_lsa(
     
     // Récupérer la liste des réseaux directement connectés (routes à préserver)
     let direct_networks: HashSet<String> = routing_table.iter()
-        .filter_map(|(network, (_, state))| {
-            if let RouteState::Active(0) = state {
+        .filter_map(|(network, (_, route_state))| {
+            if let RouteState::Active(0) = route_state {
                 Some(network.clone())
             } else {
                 None
             }
         })
         .collect();
+    
+    debug!("Protected direct networks: {:?}", direct_networks);
     
     // Récupérer la liste des voisins directs
     let neighbors_guard = state.neighbors.lock().await;
@@ -655,8 +657,6 @@ async fn update_routing_from_lsa(
         })
         .collect();
     drop(neighbors_guard);
-    
-    // Suite du traitement du LSA...
     
     // Traiter la table de routage du LSA
     for (dest, route_state) in &lsa.routing_table {
@@ -669,15 +669,16 @@ async fn update_routing_from_lsa(
             continue; // Ignorer les destinations invalides
         };
         
-        // Ne pas modifier nos propres réseaux directement connectés
+        // PROTECTION: Ne jamais modifier nos propres réseaux directement connectés
         if direct_networks.contains(&dest_network) {
-            debug!("Skipping update for directly connected network: {}", dest_network);
+            debug!("PROTECTED: Skipping update for directly connected network: {}", dest_network);
             continue;
         }
         
         match route_state {
             RouteState::Active(metric) => {
                 let existing_entry = routing_table.get(&dest_network);
+                
                 // Préserver la métrique originale pour les réseaux directement connectés
                 let new_metric = if *metric == 0 {
                     // Si c'est un réseau directement connecté pour l'émetteur LSA, ajouter 1
@@ -689,7 +690,7 @@ async fn update_routing_from_lsa(
                 
                 let should_update = match existing_entry {
                     Some((_, RouteState::Active(current_metric))) => {
-                        // Si la route existante est directe (métrique=0), ne pas la remplacer
+                        // PROTECTION: Si la route existante est directe (métrique=0), ne jamais la remplacer
                         if *current_metric == 0 {
                             false
                         } else {
@@ -701,22 +702,26 @@ async fn update_routing_from_lsa(
                 };
                 
                 if should_update {
-                    // Ne pas mettre à jour les routes vers nos voisins directs (elles sont déjà optimales)
-                    if !direct_neighbors.contains(&dest_network) {
-                        // Mettre à jour la route
-                        routing_table.insert(dest_network.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                        info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", 
+                    // Mettre à jour la route (sauf si c'est un voisin direct)
+                    routing_table.insert(dest_network.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
+                    info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", 
                          dest_network, next_hop, new_metric);
-                        
+                    
+                    // Ne pas modifier les routes système pour les réseaux directement connectés
+                    if !direct_networks.contains(&dest_network) {
                         if let Err(e) = update_routing_table_safe(&dest_network, &next_hop, prefix).await {
                             warn!("Could not update system routing table for {}: {}", dest_network, e);
                         }
                     }
                 }
             },
-            // Traitement des routes unreachable...
             RouteState::Unreachable => {
-                // Gérer les routes inaccessibles (même code qu'avant)
+                // Ne jamais marquer comme inaccessible un réseau directement connecté
+                if direct_networks.contains(&dest_network) {
+                    continue;
+                }
+                
+                // Pour les autres routes, vérifier si le next_hop actuel est celui qui annonce l'inaccessibilité
                 if let Some((current_next_hop, _)) = routing_table.get(&dest_network) {
                     if current_next_hop == &next_hop {
                         routing_table.insert(dest_network.clone(), (next_hop.clone(), RouteState::Unreachable));
