@@ -808,44 +808,92 @@ async fn update_routing_table_safe(destination: &str, gateway: &str, prefix: u8)
         return Ok(());
     }
 
-    // Sur Alpine, utiliser les commandes système directement au lieu de la bibliothèque net_route
-    // qui peut avoir des problèmes de compatibilité
+    // Vérifier que la destination est réellement un réseau et non une adresse hôte
+    // Si c'est un /32, on traite différemment pour Alpine
+    let dest_arg = if actual_prefix == 32 {
+        destination_ip.to_string()
+    } else {
+        // Calculer l'adresse réseau proprement pour s'assurer qu'elle est correctement formatée
+        let mask = (!0u32) << (32 - actual_prefix);
+        let network_int = u32::from(destination_ip) & mask;
+        let network_ip = Ipv4Addr::from(network_int);
+        format!("{}/{}", network_ip, actual_prefix)
+    };
+
     use tokio::process::Command;
     
-    // D'abord tenter de supprimer toute route existante pour éviter les conflits
-    let delete_output = Command::new("ip")
-        .args(&["route", "del", &format!("{}/{}", destination_ip, actual_prefix)])
+    // Avant d'ajouter la route, vérifier si elle existe déjà
+    let check_output = Command::new("ip")
+        .args(&["route", "show", &dest_arg])
         .output()
         .await;
     
-    // Ignorer les erreurs de suppression, elles sont attendues si la route n'existe pas
+    let route_exists = match check_output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&dest_arg)
+        },
+        Err(_) => false
+    };
+
+    // Si la route existe déjà, essayer de la supprimer d'abord
+    if route_exists {
+        let _ = Command::new("ip")
+            .args(&["route", "del", &dest_arg])
+            .output()
+            .await;
+    }
     
     // Ajouter la nouvelle route
     let add_output = Command::new("ip")
-        .args(&["route", "add", &format!("{}/{}", destination_ip, actual_prefix), 
-              "via", &gateway_ip.to_string()])
+        .args(&["route", "add", &dest_arg, "via", &gateway_ip.to_string()])
         .output()
         .await;
     
     match add_output {
         Ok(output) => {
             if output.status.success() {
-                info!("Added route to {}/{} via {}", destination_ip, actual_prefix, gateway_ip);
+                info!("Added route to {} via {}", dest_arg, gateway_ip);
                 Ok(())
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // Si l'erreur indique que la route existe déjà, ce n'est pas une erreur grave
+                
+                // Journaliser la commande exacte pour le débogage
+                warn!("Command failed: ip route add {} via {}", dest_arg, gateway_ip);
+                warn!("Error output: {}", stderr);
+                
+                // Si c'est juste que la route existe déjà, ce n'est pas une erreur critique
                 if stderr.contains("File exists") {
-                    debug!("Route already exists: {}/{} via {}", destination_ip, actual_prefix, gateway_ip);
+                    debug!("Route already exists: {} via {}", dest_arg, gateway_ip);
                     Ok(())
                 } else {
-                    warn!("Failed to add route: {}", stderr);
-                    Err(AppError::RouteError(format!("Failed to add route: {}", stderr)))
+                    // Essayer une approche alternative avec 'replace' au lieu de 'add'
+                    let replace_output = Command::new("ip")
+                        .args(&["route", "replace", &dest_arg, "via", &gateway_ip.to_string()])
+                        .output()
+                        .await;
+                        
+                    match replace_output {
+                        Ok(replace_output) => {
+                            if replace_output.status.success() {
+                                info!("Replaced route to {} via {}", dest_arg, gateway_ip);
+                                Ok(())
+                            } else {
+                                let replace_stderr = String::from_utf8_lossy(&replace_output.stderr);
+                                warn!("Failed to replace route: {}", replace_stderr);
+                                Err(AppError::RouteError(format!("Failed to add/replace route: {}", replace_stderr)))
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to execute route replace command: {}", e);
+                            Err(AppError::RouteError(format!("Command execution failed: {}", e)))
+                        }
+                    }
                 }
             }
         },
         Err(e) => {
-            warn!("Failed to execute route command: {}", e);
+            warn!("Failed to execute route add command: {}", e);
             Err(AppError::RouteError(format!("Command execution failed: {}", e)))
         }
     }
