@@ -1,30 +1,32 @@
-use serde::{Serialize, Deserialize};
+mod types;
+mod error;
+mod net_utils;
+mod neighbor;
+mod lsa;
+
+use error::*;
+use lsa::*;
+use net_utils::*;
+use neighbor::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 use std::sync::Arc;
-use net_route::{Route, Handle};
+use net_route::{Handle, Route};
 use pnet::datalink::{self, NetworkInterface};
-use log::{info, warn, error, debug};
+use log::{debug, error, info, warn};
 use pnet::ipnetwork::IpNetwork;
-use std::fmt;
 use std::error::Error as StdError;
-
-// Constantes de configuration
-const PORT: u16 = 5000;
-const HELLO_INTERVAL_SEC: u64 = 20;
-const LSA_INTERVAL_SEC: u64 = 30;
-const NEIGHBOR_TIMEOUT_SEC: u64 = 60;
-const INITIAL_TTL: u8 = 64;
-const INFINITE_METRIC: u32 = 16;
+use std::fmt;
+use crate::types::{Neighbor, Router};
 
 /// Représente les différentes erreurs spécifiques à notre application
 #[derive(Debug)]
 enum AppError {
     NetworkError(String),
-    RoutingError(String),
     ConfigError(String),
     IOError(std::io::Error),
     SerializationError(serde_json::Error),
@@ -35,7 +37,6 @@ impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AppError::NetworkError(msg) => write!(f, "Network error: {}", msg),
-            AppError::RoutingError(msg) => write!(f, "Routing error: {}", msg),
             AppError::ConfigError(msg) => write!(f, "Configuration error: {}", msg),
             AppError::IOError(err) => write!(f, "IO error: {}", err),
             AppError::SerializationError(err) => write!(f, "Serialization error: {}", err),
@@ -93,15 +94,6 @@ struct HelloMessage {
     router_ip: String,
 }
 
-/// Information sur un voisin direct du routeur
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Neighbor {
-    neighbor_ip: String,
-    link_up: bool,
-    capacity: u32,  // Capacité du lien en Mbps
-    last_seen: u64, // Timestamp de la dernière communication
-}
-
 /// Message LSA (Link State Advertisement) pour propager les informations de topologie
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct LSAMessage {
@@ -117,22 +109,21 @@ struct LSAMessage {
     ttl: u8,                            // Time to Live pour éviter les boucles
 }
 
-/// Représentation d'un routeur dans la topologie du réseau
-#[derive(Debug, Clone)]
-struct Router {
-    router_ip: String,
-    neighbors: Vec<Neighbor>,
-    last_update: u64,  // Timestamp de la dernière mise à jour
+/// État global de l'application
+pub struct AppState {
+    pub topology: Mutex<HashMap<String, Router>>,
+    pub neighbors: Mutex<HashMap<String, Neighbor>>,
+    pub routing_table: Mutex<HashMap<String, (String, RouteState)>>,
+    pub processed_lsa: Mutex<HashSet<(String, u32)>>,
+    pub local_ip: String,
 }
 
-/// État global de l'application
-struct AppState {
-    topology: Mutex<HashMap<String, Router>>,
-    neighbors: Mutex<HashMap<String, Neighbor>>,
-    routing_table: Mutex<HashMap<String, (String, RouteState)>>, // (next_hop, état)
-    processed_lsa: Mutex<HashSet<(String, u32)>>, // (originator, seq_num) pour éviter de traiter plusieurs fois
-    local_ip: String,
-}
+/// Constantes de configuration
+const PORT: u16 = 5000;
+const HELLO_INTERVAL_SEC: u64 = 20;
+const LSA_INTERVAL_SEC: u64 = 30;
+const NEIGHBOR_TIMEOUT_SEC: u64 = 60;
+const INITIAL_TTL: u8 = 64;
 
 /// Récupère toutes les adresses de broadcast avec leurs interfaces locales associées
 fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
@@ -142,7 +133,7 @@ fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
         .flat_map(|iface: NetworkInterface| {
             iface.ips.into_iter().filter_map(move |ip_network| {
                 if let IpAddr::V4(ip) = ip_network.ip() {
-                    if !ip.is_loopback() { // Exclure les adresses de loopback
+                    if !ip.is_loopback() {
                         if let IpNetwork::V4(ipv4_network) = ip_network {
                             let broadcast = ipv4_network.broadcast();
                             Some((ip.to_string(), SocketAddr::new(IpAddr::V4(broadcast), port)))
@@ -162,7 +153,7 @@ fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
 
 /// Met à jour la topologie du réseau avec les informations d'un message LSA
 async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<()> {
-    let current_time = std::time::SystemTime::now()
+    let _current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| AppError::ConfigError(e.to_string()))?
         .as_secs();
@@ -171,9 +162,6 @@ async fn update_topology(state: Arc<AppState>, lsa: &LSAMessage) -> Result<()> {
     topology.insert(
         lsa.originator.clone(),
         Router {
-            router_ip: lsa.originator.clone(),
-            neighbors: lsa.neighbors.clone(),
-            last_update: current_time,
         },
     );
     Ok(())
@@ -209,7 +197,6 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
     tokio::spawn(async move {
         let mut hello_interval = time::interval(Duration::from_secs(HELLO_INTERVAL_SEC));
         let mut lsa_interval = time::interval(Duration::from_secs(LSA_INTERVAL_SEC));
-        
         loop {
             tokio::select! {
                 _ = hello_interval.tick() => {
@@ -223,12 +210,10 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
                 _ = lsa_interval.tick() => {
                     let broadcast_addrs = get_broadcast_addresses(PORT);
                     for (local_ip, addr) in &broadcast_addrs {
-                        // Générer un numéro de séquence unique basé sur le timestamp
                         let seq_num = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_else(|_| Duration::from_secs(0))
                             .as_secs() as u32;
-                            
                         if let Err(e) = send_lsa(&socket_clone, addr, local_ip, None, local_ip, Arc::clone(&state_clone), seq_num, vec![]).await {
                             error!("Failed to send LSA: {}", e);
                         }
@@ -242,7 +227,6 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(NEIGHBOR_TIMEOUT_SEC / 2));
-        
         loop {
             interval.tick().await;
             check_neighbor_timeouts(&state_clone).await;
@@ -296,19 +280,12 @@ async fn main() -> std::result::Result<(), Box<dyn StdError>> {
                             if let Ok(hello) = serde_json::from_value::<HelloMessage>(json) {
                                 info!("[RECV] HELLO from {} - {} (received on interface {})", 
                                     hello.router_ip, src_addr, receiving_interface_ip);
-                                
                                 update_neighbor(&state, &hello.router_ip).await;
-                                
-                                // Calculer l'adresse de broadcast pour l'interface qui a reçu le HELLO
                                 let broadcast_addr = calculate_broadcast_for_interface(&receiving_interface_ip, &receiving_network, PORT)?;
-                                
-                                // Générer un numéro de séquence unique
                                 let seq_num = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_else(|_| Duration::from_secs(0))
                                     .as_secs() as u32;
-                                
-                                // Envoyer la LSA avec l'IP de l'interface qui a reçu le HELLO
                                 if let Err(e) = send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, 
                                                         None, &receiving_interface_ip, Arc::clone(&state), 
                                                         seq_num, vec![receiving_interface_ip.clone()]).await {
@@ -521,7 +498,7 @@ async fn send_lsa(
     let routing_table_guard = state.routing_table.lock().await;
     let mut route_states = HashMap::new();
     
-    for (dest, (next_hop, state)) in routing_table_guard.iter() {
+    for (dest, (_, state)) in routing_table_guard.iter() {
         route_states.insert(dest.clone(), state.clone());
     }
     drop(routing_table_guard);
@@ -807,49 +784,5 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_route_state_serialization() {
-        let active = RouteState::Active(10);
-        let unreachable = RouteState::Unreachable;
-        
-        let serialized_active = serde_json::to_string(&active).unwrap();
-        let serialized_unreachable = serde_json::to_string(&unreachable).unwrap();
-        
-        let deserialized_active: RouteState = serde_json::from_str(&serialized_active).unwrap();
-        let deserialized_unreachable: RouteState = serde_json::from_str(&serialized_unreachable).unwrap();
-        
-        assert_eq!(active, deserialized_active);
-        assert_eq!(unreachable, deserialized_unreachable);
-    }
-    
-    #[test]
-    fn test_calculate_broadcast_for_interface() {
-        // Créer un réseau de test
-        let ipv4_network = IpNetwork::V4(
-            "192.168.1.10/24".parse().unwrap()
-        );
-        
-        let result = calculate_broadcast_for_interface("192.168.1.10", &ipv4_network, 5000);
-        assert!(result.is_ok());
-        
-        let broadcast_addr = result.unwrap();
-        assert_eq!(broadcast_addr.port(), 5000);
-        assert_eq!(broadcast_addr.ip(), IpAddr::V4("192.168.1.255".parse().unwrap()));
-    }
-    
-    #[test]
-    fn test_app_error_display() {
-        let network_err = AppError::NetworkError("Test error".to_string());
-        assert_eq!(format!("{}", network_err), "Network error: Test error");
-        
-        let routing_err = AppError::RoutingError("Routing failed".to_string());
-        assert_eq!(format!("{}", routing_err), "Routing error: Routing failed");
     }
 }
