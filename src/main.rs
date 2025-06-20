@@ -630,7 +630,8 @@ async fn update_routing_from_lsa(
             routing_table.insert(lsa.originator.clone(), (next_hop.clone(), RouteState::Active(metric)));
             info!("Updated route: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
 
-            if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
+            // Exemple : mise à jour de la route pour l'originator
+            if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop, 24).await {
                 warn!("Could not update system routing table for {}: {}", lsa.originator, e);
             }
         }
@@ -661,7 +662,7 @@ async fn update_routing_from_lsa(
                 info!("Updated route: {} -> next_hop: {} (metric: {})", 
                       neighbor.neighbor_ip, next_hop, neighbor_metric + 1);
                 
-                if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
+                if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop, 24).await {
                     warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
                 }
             }
@@ -710,7 +711,7 @@ async fn update_routing_from_lsa(
                     routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
                     info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
                     
-                    if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
+                    if let Err(e) = update_routing_table_safe(dest, &next_hop, 24).await {
                         warn!("Could not update system routing table for {}: {}", dest, e);
                     }
                 }
@@ -761,12 +762,11 @@ async fn send_poisoned_route(
     Ok(())
 }
 
-/// Version sécurisée pour mettre à jour la table de routage système
-async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
+/// Version modifiée pour mettre à jour la table de routage système avec un préfixe
+async fn update_routing_table_safe(destination: &str, gateway: &str, prefix: u8) -> Result<()> {
     // Valider les adresses IP
     let destination_ip: Ipv4Addr = destination.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e)))?;
-    
     let gateway_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
 
@@ -782,7 +782,7 @@ async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<(
         .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
     
     // Calculer l'adresse réseau en appliquant un masque /32 pour une route host spécifique
-    let route = Route::new(IpAddr::V4(destination_ip), 32)
+    let route = Route::new(IpAddr::V4(destination_ip), prefix)
         .with_gateway(IpAddr::V4(gateway_ip));
 
     // Essayer d'ajouter la route
