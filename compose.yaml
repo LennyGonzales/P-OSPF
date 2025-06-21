@@ -109,7 +109,13 @@ services:
     image: alpine
     container_name: t_a2
     hostname: t_a2
-    command: sleep infinity
+    command: |
+      sh -c "
+        sleep 5 &&
+        ip route del default &&
+        ip route add default via 192.168.2.1 &&
+        sleep infinity
+      "
     cap_add:
       - NET_ADMIN
     networks:
@@ -120,7 +126,13 @@ services:
     image: alpine
     container_name: t_a3
     hostname: t_a3
-    command: sleep infinity
+    command: |
+      sh -c "
+        sleep 5 &&
+        ip route del default &&
+        ip route add default via 192.168.3.1 &&
+        sleep infinity
+      "
     cap_add:
       - NET_ADMIN
     networks:
