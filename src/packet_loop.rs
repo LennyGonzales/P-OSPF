@@ -32,9 +32,11 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                 continue;
             }
         };
+        log::debug!("Receiving interface IP: {}, Network: {}", receiving_interface_ip, receiving_network);
         match serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
             Ok(json) => {
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
+                    log::debug!("Received message type: {}", message_type);
                     match message_type {
                         1 => {
                             // Vérifier si le protocole OSPF est activé avant de traiter les HELLO
@@ -115,22 +117,85 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                         3 => {
                             // Message de contrôle : enable/disable
                             if let Some(command) = json.get("command").and_then(|v| v.as_str()) {
+                                log::info!("[CLI] Received control command from {}: {}", src_addr, command);
                                 match command {
+                                    "connexion" => {
+                                        log::info!("[CLI] New connection from {}", src_addr);
+                                        let response = "Connexion établie avec succès";
+                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                            log::warn!("[CLI] Failed to send connexion response: {}", e);
+                                        }
+                                    },
                                     "enable" => {
                                         state.enable().await;
-                                        info!("Protocole activé via commande réseau");
+                                        log::info!("[CLI] Protocole activé via commande réseau");
+                                        let response = "Protocole OSPF activé";
+                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                            log::warn!("[CLI] Failed to send enable confirmation: {}", e);
+                                        }
                                     },
                                     "disable" => {
                                         state.disable().await;
-                                        info!("Protocole désactivé via commande réseau");
+                                        log::info!("[CLI] Protocole désactivé via commande réseau");
+                                        let response = "Protocole OSPF désactivé";
+                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                            log::warn!("[CLI] Failed to send disable confirmation: {}", e);
+                                        }
                                     },
-                                    _ => warn!("Commande de contrôle inconnue: {}", command),
+                                    "routing-table" => {
+                                        let routing_table = state.routing_table.lock().await;
+                                        let table_str = if routing_table.is_empty() {
+                                            "Table de routage vide".to_string()
+                                        } else {
+                                            routing_table.iter()
+                                                .map(|(key, (next_hop, state))| format!("{} -> {} ({:?})", key, next_hop, state))
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        };
+                                        log::info!("[CLI] Routing table requested, sending to {}", src_addr);
+                                        if let Err(e) = socket.send_to(table_str.as_bytes(), src_addr).await {
+                                            log::warn!("[CLI] Failed to send routing table: {}", e);
+                                        }
+                                    },
+                                    "neighbors" => {
+                                        let neighbors = state.neighbors.lock().await;
+                                        let neighbors_str = if neighbors.is_empty() {
+                                            "Aucun voisin détecté".to_string()
+                                        } else {
+                                            neighbors.iter()
+                                                .map(|(ip, neighbor)| {
+                                                    let current_time = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+                                                        .as_secs();
+                                                    let age = current_time.saturating_sub(neighbor.last_seen);
+                                                    format!("{} (dernière activité: il y a {} secondes)", ip, age)
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        };
+                                        log::info!("[CLI] Neighbors list requested, sending to {}", src_addr);
+                                        if let Err(e) = socket.send_to(neighbors_str.as_bytes(), src_addr).await {
+                                            log::warn!("[CLI] Failed to send neighbors list: {}", e);
+                                        }
+                                    },
+                                    _ => {
+                                        log::warn!("[CLI] Commande de contrôle inconnue: {}", command);
+                                        let response = format!("Commande inconnue: '{}'. Utilisez 'help' pour voir les commandes disponibles.", command);
+                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                            log::warn!("[CLI] Failed to send error response: {}", e);
+                                        }
+                                    }
                                 }
                             } else {
-                                warn!("Message de contrôle sans champ 'command'");
+                                log::warn!("[CLI] Message de contrôle sans champ 'command'");
+                                let response = "Erreur: message de contrôle sans commande";
+                                if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                    log::warn!("[CLI] Failed to send error response: {}", e);
+                                }
                             }
                         }
-                        _ => log::warn!("Unknown message type: {}", message_type),
+                        _ => log::warn!("[CLI] Unknown message type: {}", message_type),
                     }
                 } else {
                     log::warn!("No message_type field in received JSON");
