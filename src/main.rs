@@ -8,6 +8,7 @@ mod tasks;
 mod packet_loop;
 mod hello;
 mod read_config;
+mod dijkstra;
 
 use error::*;
 use lsa::*;
@@ -78,8 +79,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     info!("Router IP: {}", router_ip);
     let socket = init_socket(PORT).await?;
     let state = init_state(router_ip, config);
+    
+    // Calculer les routes initiales
+    if let Err(e) = dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await {
+        warn!("Échec du calcul initial des routes: {}", e);
+    }
+    
     spawn_hello_and_lsa_tasks(std::sync::Arc::clone(&socket), std::sync::Arc::clone(&state));
     spawn_neighbor_timeout_task(std::sync::Arc::clone(&state));
+    
     main_loop(socket, state).await?;
     Ok(())
 }

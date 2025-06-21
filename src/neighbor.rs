@@ -47,6 +47,16 @@ pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
                 last_seen: current_time,
             }
         });
+    
+    // Déclencher un recalcul des routes si c'est un nouveau voisin ou un changement d'état
+    let state_clone = Arc::clone(state);
+    tokio::spawn(async move {
+        // Attendre un peu pour que les changements se stabilisent
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if let Err(e) = crate::dijkstra::calculate_and_update_optimal_routes(state_clone).await {
+            log::warn!("Échec du recalcul des routes après changement de voisin: {}", e);
+        }
+    });
 }
 
 pub async fn check_neighbor_timeouts(state: &Arc<AppState>) {
