@@ -20,5 +20,9 @@ hostname = "0.3"
 
 
 [[bin]]
-name = "routing_project"
+name = "routing"
 path = "src/main.rs"
+
+[[bin]]
+name = "cli"
+path = "src/cli.rs"

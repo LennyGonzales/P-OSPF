@@ -1,0 +1,186 @@
+version: '3.8'
+
+services:
+  r1:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: r1
+    hostname: r1
+    volumes:
+      - ./:/usr/src/app
+      - cargo_target:/usr/src/app/target
+    networks:
+      N_A1:
+        ipv4_address: 192.168.1.1
+      N_C1:
+        ipv4_address: 10.1.0.1
+    cap_add:
+      - NET_ADMIN
+
+  r2:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: r2
+    hostname: r2
+    volumes:
+      - ./:/usr/src/app
+      - cargo_target:/usr/src/app/target
+    networks:
+      N_A2:
+        ipv4_address: 192.168.2.1
+      N_C1:
+        ipv4_address: 10.1.0.2
+      N_C2:
+        ipv4_address: 10.2.0.2
+    cap_add:
+      - NET_ADMIN
+
+  r3:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: r3
+    hostname: r3
+    volumes:
+      - ./:/usr/src/app
+      - cargo_target:/usr/src/app/target
+    networks:
+      N_A3:
+        ipv4_address: 192.168.3.1
+      N_C3:
+        ipv4_address: 10.3.0.3
+    cap_add:
+      - NET_ADMIN
+
+  r4:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: r4
+    hostname: r4
+    volumes:
+      - ./:/usr/src/app
+      - cargo_target:/usr/src/app/target
+    networks:
+      N_C1:
+        ipv4_address: 10.1.0.4
+      N_C2:
+        ipv4_address: 10.2.0.4
+    cap_add:
+      - NET_ADMIN
+
+  r5:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: r5
+    hostname: r5
+    volumes:
+      - ./:/usr/src/app
+      - cargo_target:/usr/src/app/target
+    networks:
+      N_C2:
+        ipv4_address: 10.2.0.5
+      N_C3:
+        ipv4_address: 10.3.0.5
+    cap_add:
+      - NET_ADMIN
+
+  t_a1:
+    image: alpine
+    container_name: t_a1
+    hostname: t_a1
+    command: |
+      sh -c "
+        sleep 5 &&
+        ip route del default &&
+        ip route add default via 192.168.1.1 &&
+        sleep infinity
+      "
+    cap_add:
+      - NET_ADMIN
+    networks:
+      N_A1:
+        ipv4_address: 192.168.1.10
+
+  t_a2:
+    image: alpine
+    container_name: t_a2
+    hostname: t_a2
+    command: |
+      sh -c "
+        sleep 5 &&
+        ip route del default &&
+        ip route add default via 192.168.2.1 &&
+        sleep infinity
+      "
+    cap_add:
+      - NET_ADMIN
+    networks:
+      N_A2:
+        ipv4_address: 192.168.2.10
+
+  t_a3:
+    image: alpine
+    container_name: t_a3
+    hostname: t_a3
+    command: |
+      sh -c "
+        sleep 5 &&
+        ip route del default &&
+        ip route add default via 192.168.3.1 &&
+        sleep infinity
+      "
+    cap_add:
+      - NET_ADMIN
+    networks:
+      N_A3:
+        ipv4_address: 192.168.3.10
+
+volumes:
+  cargo_target:
+
+networks:
+  N_A1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24
+          gateway: 192.168.1.254
+
+  N_A2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.2.0/24
+          gateway: 192.168.2.254
+
+  N_A3:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.3.0/24
+          gateway: 192.168.3.254
+
+  N_C1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24
+          gateway: 10.1.0.254
+
+  N_C2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+          gateway: 10.2.0.254
+
+  N_C3:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.3.0.0/24
+          gateway: 10.3.0.254
