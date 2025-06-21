@@ -6,4 +6,4 @@ link_active = true
 [[interfaces]]
 name = "eth1"
 capacity_mbps = 10    # Lien très lent vers R_5 (backup)
-link_active = false   # Interface de backup désactivée
+link_active = true
