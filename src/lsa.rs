@@ -42,21 +42,38 @@ pub async fn send_lsa(
     }
     drop(routing_table_guard);
     
-    // Ajouter tous les réseaux locaux (interfaces directes) dans la LSA
+    // Propager les réseaux selon les bonnes pratiques OSPF
     use pnet::datalink;
     use pnet::ipnetwork::IpNetwork;
     let interfaces = datalink::interfaces();
+    let mut has_access_network = false;
+    
     for iface in interfaces {
         for ip_network in iface.ips {
             if let IpNetwork::V4(ipv4_network) = ip_network {
                 let ip = ipv4_network.ip();
                 if !ip.is_loopback() && !ip.is_unspecified() {
                     let network_cidr = ipv4_network.to_string();
-                    // Ajouter ce réseau local comme directement accessible (métrique 0)
-                    route_states.insert(network_cidr, crate::types::RouteState::Active(0));
+                    
+                    // - Propager les réseaux de cœur (backbone) : 10.x.x.x
+                    // - Propager AUSSI les réseaux d'accès pour la démo : 192.168.x.x
+                    if ip.octets()[0] == 10 {
+                        route_states.insert(network_cidr.clone(), crate::types::RouteState::Active(0));
+                        debug!("Router {} advertising backbone network {}", router_ip, network_cidr);
+                    } else if ip.octets()[0] == 192 && ip.octets()[1] == 168 {
+                        route_states.insert(network_cidr.clone(), crate::types::RouteState::Active(0));
+                        has_access_network = true;
+                        debug!("Router {} advertising access network {} (academic demo)", router_ip, network_cidr);
+                    }
                 }
             }
         }
+    }
+    
+    // Les routeurs d'accès propagent aussi une route par défaut
+    if has_access_network {
+        route_states.insert("0.0.0.0/0".to_string(), crate::types::RouteState::Active(20));
+        debug!("Access router {} advertising default route", router_ip);
     }
 
     let message = crate::types::LSAMessage {
@@ -140,55 +157,44 @@ pub async fn update_routing_from_lsa(
             }
         }
     }
-    for neighbor in &lsa.neighbors {
-        if neighbor.link_up {
-            if neighbor.neighbor_ip == state.local_ip {
-                continue;
-            }
-            // Utiliser le réseau de l'interface comme clé (ex: 10.2.0.0/24)
-            // À adapter : il faut que le LSA transporte le préfixe réseau du voisin
-            // Pour l'instant, on suppose que neighbor.neighbor_ip est déjà un préfixe réseau CIDR
-            let network_prefix = &neighbor.neighbor_ip; // Ex: "10.2.0.0/24"
-            let existing_entry = routing_table.get(network_prefix);
-            let neighbor_metric = (100 / neighbor.capacity.max(1)) as u32;
-            let should_update = match existing_entry {
-                Some((_, crate::types::RouteState::Active(current_metric))) => {
-                    neighbor_metric + 1 < *current_metric
-                },
-                Some((_, crate::types::RouteState::Unreachable)) => true,
-                None => true,
-            };
-            if should_update {
-                routing_table.insert(network_prefix.clone(), 
-                                  (next_hop.clone(), crate::types::RouteState::Active(neighbor_metric + 1)));
-                info!("Updated route: {} -> next_hop: {} (metric: {})", 
-                      network_prefix, next_hop, neighbor_metric + 1);
-                if let Err(e) = update_routing_table_safe(network_prefix, &next_hop).await {
-                    warn!("Could not update system routing table for {}: {}", network_prefix, e);
-                }
-            }
-        } else if routing_table.contains_key(&neighbor.neighbor_ip) {
-            info!("Route poisoning: {} -> unreachable", neighbor.neighbor_ip);
-            routing_table.insert(neighbor.neighbor_ip.clone(), 
-                              (next_hop.clone(), crate::types::RouteState::Unreachable));
-            let broadcast_addrs = crate::net_utils::get_broadcast_addresses(super::PORT);
-            for (local_ip, addr) in &broadcast_addrs {
-                let seq_num = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-                    .as_secs() as u32;
-                let path = vec![state.local_ip.clone()];
-                if let Err(e) = send_poisoned_route(socket, addr, local_ip, &neighbor.neighbor_ip, 
-                                                  seq_num, path).await {
-                    error!("Failed to send poisoned route: {}", e);
-                }
-            }
-        }
-    }
+    // Traiter les routes depuis la table de routage de la LSA (réseaux uniquement)
     for (dest, route_state) in &lsa.routing_table {
+        // Ignorer les routes vers soi-même
         if dest == &state.local_ip {
             continue;
         }
+        
+        // Ignorer les routes vers des IPs individuelles (ne traiter que les réseaux CIDR)
+        if !dest.contains('/') {
+            debug!("Skipping individual IP route: {}", dest);
+            continue;
+        }
+        
+        // Vérifier si c'est un réseau valide (pas une route vers une IP du même réseau local)
+        if let Ok(dest_network) = dest.parse::<pnet::ipnetwork::IpNetwork>() {
+            if let pnet::ipnetwork::IpNetwork::V4(dest_net) = dest_network {
+                // Vérifier si ce réseau est déjà directement connecté (éviter les doublons)
+                let interfaces = pnet::datalink::interfaces();
+                let mut is_local = false;
+                for iface in interfaces {
+                    for ip_network in iface.ips {
+                        if let pnet::ipnetwork::IpNetwork::V4(local_net) = ip_network {
+                            if dest_net.network() == local_net.network() && dest_net.prefix() == local_net.prefix() {
+                                is_local = true;
+                                break;
+                            }
+                        }
+                    }
+                    if is_local { break; }
+                }
+                
+                if is_local {
+                    debug!("Skipping route to local network: {}", dest);
+                    continue;
+                }
+            }
+        }
+        
         match route_state {
             crate::types::RouteState::Active(metric) => {
                 let existing_entry = routing_table.get(dest);
@@ -200,7 +206,7 @@ pub async fn update_routing_from_lsa(
                 };
                 if should_update {
                     routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                    info!("Learned route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
+                    info!("Learned network route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
                     if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
                         warn!("Could not update system routing table for {}: {}", dest, e);
                     }
@@ -210,7 +216,7 @@ pub async fn update_routing_from_lsa(
                 if let Some((current_next_hop, _)) = routing_table.get(dest) {
                     if current_next_hop == &next_hop {
                         routing_table.insert(dest.clone(), (next_hop.clone(), crate::types::RouteState::Unreachable));
-                        info!("Route marked as unreachable: {}", dest);
+                        info!("Network route marked as unreachable: {}", dest);
                     }
                 }
             }
@@ -250,6 +256,13 @@ pub async fn send_poisoned_route(
 pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crate::error::Result<()> {
     use pnet::ipnetwork::IpNetwork;
     use pnet::datalink;
+    
+    // Vérifier si c'est une route vers un réseau (CIDR) ou une IP individuelle
+    if !destination.contains('/') {
+        debug!("Skipping route to individual IP (not a network): {}", destination);
+        return Ok(());
+    }
+    
     let network: IpNetwork = destination.parse()
         .map_err(|e| crate::error::AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
     let gateway_ip: Ipv4Addr = gateway.parse()
