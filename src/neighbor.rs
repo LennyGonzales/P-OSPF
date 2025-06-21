@@ -6,7 +6,6 @@ use log::{info, warn, error};
 use crate::AppState;
 use std::time::Duration;
 
-use crate::types::{Neighbor};
 use crate::net_utils::get_broadcast_addresses;
 
 pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
