@@ -11,7 +11,7 @@ pub async fn init_socket(port: u16) -> crate::error::Result<std::sync::Arc<tokio
     Ok(socket)
 }
 
-pub fn init_state(router_ip: String) -> std::sync::Arc<crate::AppState> {
+pub fn init_state(router_ip: String, config: crate::read_config::RouterConfig) -> std::sync::Arc<crate::AppState> {
     std::sync::Arc::new(crate::AppState {
         topology: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         neighbors: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -19,5 +19,6 @@ pub fn init_state(router_ip: String) -> std::sync::Arc<crate::AppState> {
         processed_lsa: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         local_ip: router_ip,
         enabled: tokio::sync::Mutex::new(true), // OSPF activé par défaut
+        config,
     })
 }

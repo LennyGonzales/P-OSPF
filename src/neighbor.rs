@@ -13,21 +13,37 @@ pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs();
+    
+    // Obtenir les informations de l'interface pour ce voisin
+    let (capacity, link_active) = get_interface_info_for_neighbor(state, neighbor_ip).await;
+    
     let mut neighbors = state.neighbors.lock().await;
     neighbors.entry(neighbor_ip.to_string())
         .and_modify(|n| {
             n.last_seen = current_time;
-            if !n.link_up {
-                info!("Neighbor {} is now UP", neighbor_ip);
-                n.link_up = true;
+            n.capacity = capacity;
+            // Le lien n'est considéré comme UP que si l'interface est active ET le voisin répond
+            let should_be_up = link_active && true; // true car on a reçu un message du voisin
+            if n.link_up != should_be_up {
+                if should_be_up {
+                    info!("Neighbor {} is now UP (capacity: {} Mbps)", neighbor_ip, capacity);
+                } else {
+                    warn!("Neighbor {} is now DOWN (interface inactive)", neighbor_ip);
+                }
+                n.link_up = should_be_up;
             }
         })
         .or_insert_with(|| {
-            info!("New neighbor discovered: {}", neighbor_ip);
+            let should_be_up = link_active;
+            if should_be_up {
+                info!("New neighbor discovered: {} (capacity: {} Mbps)", neighbor_ip, capacity);
+            } else {
+                warn!("New neighbor discovered but interface is DOWN: {}", neighbor_ip);
+            }
             crate::types::Neighbor {
                 neighbor_ip: neighbor_ip.to_string(),
-                link_up: true,
-                capacity: 100,
+                link_up: should_be_up,
+                capacity,
                 last_seen: current_time,
             }
         });
@@ -59,4 +75,80 @@ pub async fn check_neighbor_timeouts(state: &Arc<AppState>) {
             }
         }
     }
+}
+
+/// Détermine la capacité et l'état d'une interface pour un voisin donné
+async fn get_interface_info_for_neighbor(state: &Arc<AppState>, neighbor_ip: &str) -> (u32, bool) {
+    // Pour l'instant, on utilise la première interface active configurée
+    // Dans une implémentation plus avancée, on pourrait déterminer l'interface
+    // en fonction de l'adresse IP du voisin et des réseaux configurés
+    
+    for interface in &state.config.interfaces {
+        if interface.link_active {
+            return (interface.capacity_mbps, true);
+        }
+    }
+    
+    // Si aucune interface active, utiliser la première interface disponible
+    if let Some(interface) = state.config.interfaces.first() {
+        (interface.capacity_mbps, interface.link_active)
+    } else {
+        (100, false) // Valeurs par défaut
+    }
+}
+
+/// Affiche un rapport détaillé de l'état des interfaces
+pub async fn display_interface_report(state: &Arc<AppState>) {
+    use log::info;
+    
+    info!("=== RAPPORT D'ÉTAT DES INTERFACES ===");
+    
+    if state.config.interfaces.is_empty() {
+        info!("Aucune interface configurée");
+        return;
+    }
+    
+    info!("{:<10} {:<12} {:<8} {:<10}", "Interface", "Capacité", "État", "Coût OSPF");
+    info!("{}", "-".repeat(45));
+    
+    for interface in &state.config.interfaces {
+        let status = if interface.link_active { "ACTIF" } else { "INACTIF" };
+        let cost = if interface.link_active {
+            // Calculer le coût OSPF (100 Mbps de référence)
+            let reference_bandwidth = 100_000_000;
+            let bandwidth_bps = interface.capacity_mbps * 1_000_000;
+            let cost = reference_bandwidth / bandwidth_bps;
+            cost.max(1)
+        } else {
+            u32::MAX
+        };
+        
+        let cost_str = if cost == u32::MAX {
+            "∞".to_string()
+        } else {
+            cost.to_string()
+        };
+        
+        info!("{:<10} {:<12} {:<8} {:<10}", 
+              interface.name, 
+              format!("{} Mbps", interface.capacity_mbps),
+              status,
+              cost_str);
+    }
+    
+    // Statistiques générales
+    let total_interfaces = state.config.interfaces.len();
+    let active_interfaces = state.config.interfaces.iter()
+        .filter(|iface| iface.link_active)
+        .count();
+    
+    info!("Total interfaces: {} (actives: {})", total_interfaces, active_interfaces);
+    
+    // Capacité totale disponible
+    let total_capacity: u32 = state.config.interfaces.iter()
+        .filter(|iface| iface.link_active)
+        .map(|iface| iface.capacity_mbps)
+        .sum();
+    
+    info!("Capacité totale disponible: {} Mbps", total_capacity);
 }

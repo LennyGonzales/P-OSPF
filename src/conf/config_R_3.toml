@@ -1,0 +1,9 @@
+[[interfaces]]
+name = "eth0"
+capacity_mbps = 100
+link_active = true
+
+[[interfaces]]
+name = "eth1"
+capacity_mbps = 1000
+link_active = true
