@@ -32,7 +32,7 @@ pub struct LSAMessage {
     pub seq_num: u32,
     pub neighbor_count: usize,
     pub neighbors: Vec<Neighbor>,
-    pub routing_table: HashMap<String, RouteState>,
+    pub routing_table: HashMap<String, RouteState>, // Clé = préfixe réseau CIDR (ex: "10.2.0.0/24")
     pub path: Vec<String>,
     pub ttl: u8,
 }

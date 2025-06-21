@@ -41,6 +41,23 @@ pub async fn send_lsa(
         route_states.insert(dest.clone(), state.clone());
     }
     drop(routing_table_guard);
+    
+    // Ajouter tous les réseaux locaux (interfaces directes) dans la LSA
+    use pnet::datalink;
+    use pnet::ipnetwork::IpNetwork;
+    let interfaces = datalink::interfaces();
+    for iface in interfaces {
+        for ip_network in iface.ips {
+            if let IpNetwork::V4(ipv4_network) = ip_network {
+                let ip = ipv4_network.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    let network_cidr = ipv4_network.to_string();
+                    // Ajouter ce réseau local comme directement accessible (métrique 0)
+                    route_states.insert(network_cidr, crate::types::RouteState::Active(0));
+                }
+            }
+        }
+    }
 
     let message = crate::types::LSAMessage {
         message_type: 2,
@@ -128,7 +145,11 @@ pub async fn update_routing_from_lsa(
             if neighbor.neighbor_ip == state.local_ip {
                 continue;
             }
-            let existing_entry = routing_table.get(&neighbor.neighbor_ip);
+            // Utiliser le réseau de l'interface comme clé (ex: 10.2.0.0/24)
+            // À adapter : il faut que le LSA transporte le préfixe réseau du voisin
+            // Pour l'instant, on suppose que neighbor.neighbor_ip est déjà un préfixe réseau CIDR
+            let network_prefix = &neighbor.neighbor_ip; // Ex: "10.2.0.0/24"
+            let existing_entry = routing_table.get(network_prefix);
             let neighbor_metric = (100 / neighbor.capacity.max(1)) as u32;
             let should_update = match existing_entry {
                 Some((_, crate::types::RouteState::Active(current_metric))) => {
@@ -138,12 +159,12 @@ pub async fn update_routing_from_lsa(
                 None => true,
             };
             if should_update {
-                routing_table.insert(neighbor.neighbor_ip.clone(), 
+                routing_table.insert(network_prefix.clone(), 
                                   (next_hop.clone(), crate::types::RouteState::Active(neighbor_metric + 1)));
                 info!("Updated route: {} -> next_hop: {} (metric: {})", 
-                      neighbor.neighbor_ip, next_hop, neighbor_metric + 1);
-                if let Err(e) = update_routing_table_safe(&neighbor.neighbor_ip, &next_hop).await {
-                    warn!("Could not update system routing table for {}: {}", neighbor.neighbor_ip, e);
+                      network_prefix, next_hop, neighbor_metric + 1);
+                if let Err(e) = update_routing_table_safe(network_prefix, &next_hop).await {
+                    warn!("Could not update system routing table for {}: {}", network_prefix, e);
                 }
             }
         } else if routing_table.contains_key(&neighbor.neighbor_ip) {
@@ -227,22 +248,67 @@ pub async fn send_poisoned_route(
 }
 
 pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crate::error::Result<()> {
-    let destination_ip: Ipv4Addr = destination.parse()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Invalid destination IP {}: {}", destination, e)))?;
+    use pnet::ipnetwork::IpNetwork;
+    use pnet::datalink;
+    let network: IpNetwork = destination.parse()
+        .map_err(|e| crate::error::AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
     let gateway_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| crate::error::AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
-    if destination_ip.is_loopback() || destination_ip.is_unspecified() || 
-       gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
-        debug!("Skipping route to invalid address: {} via {}", destination, gateway);
+    if gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
+        debug!("Skipping route to invalid gateway: {} via {}", destination, gateway);
         return Ok(());
+    }
+    // Vérifier que la gateway est directement accessible (sur un réseau local)
+    let interfaces = datalink::interfaces();
+    let mut gateway_is_local = false;
+    let mut local_networks = Vec::new();
+    
+    for iface in interfaces {
+        for ip_network in iface.ips {
+            if let IpNetwork::V4(ipv4_network) = ip_network {
+                local_networks.push(ipv4_network.to_string());
+                if ipv4_network.contains(gateway_ip) {
+                    debug!("Gateway {} found in local network {}", gateway_ip, ipv4_network);
+                    gateway_is_local = true;
+                    break;
+                }
+            }
+        }
+        if gateway_is_local { break; }
+    }
+    
+    if !gateway_is_local {
+        debug!("Gateway {} is not in any local networks: {:?}", gateway, local_networks);
+        debug!("Skipping route to {} via non-local gateway {}", destination, gateway);
+        return Ok(());
+    }
+    
+    // Vérification supplémentaire : éviter d'ajouter une route vers son propre réseau
+    if let IpNetwork::V4(dest_net) = network {
+        for iface in datalink::interfaces() {
+            for ip_network in iface.ips {
+                if let IpNetwork::V4(local_net) = ip_network {
+                    if dest_net.network() == local_net.network() && dest_net.prefix() == local_net.prefix() {
+                        debug!("Skipping route to local network {} via {}", destination, gateway);
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
     let handle = net_route::Handle::new()
         .map_err(|e| crate::error::AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
-    let route = net_route::Route::new(IpAddr::V4(destination_ip), 32)
+    let (ip, prefix) = match network {
+        IpNetwork::V4(net) => (IpAddr::V4(net.network()), net.prefix()),
+        IpNetwork::V6(_) => {
+            return Err(crate::error::AppError::RouteError("IPv6 not supported".to_string()));
+        }
+    };
+    let route = net_route::Route::new(ip, prefix as u8)
         .with_gateway(IpAddr::V4(gateway_ip));
     match handle.add(&route).await {
         Ok(_) => {
-            info!("Successfully added host route to {} via {}", destination_ip, gateway_ip);
+            info!("Successfully added network route to {} via {}", destination, gateway_ip);
             Ok(())
         },
         Err(e) => {
@@ -250,11 +316,11 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
             let _ = handle.delete(&route).await;
             match handle.add(&route).await {
                 Ok(_) => {
-                    info!("Successfully updated host route to {} via {}", destination_ip, gateway_ip);
+                    info!("Successfully updated network route to {} via {}", destination, gateway_ip);
                     Ok(())
                 },
                 Err(e2) => {
-                    warn!("Failed to add/update route to {} via {}: {}", destination_ip, gateway_ip, e2);
+                    warn!("Failed to add/update route to {} via {}: {}", destination, gateway_ip, e2);
                     Err(crate::error::AppError::RouteError(format!("Routing update failed: {}", e2)))
                 }
             }

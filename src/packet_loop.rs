@@ -38,14 +38,16 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                 log::info!("[RECV] HELLO from {} - {} (received on interface {})", 
                                     hello.router_ip, src_addr, receiving_interface_ip);
                                 crate::neighbor::update_neighbor(&state, &hello.router_ip).await;
+                                // Utiliser le préfixe réseau de l'interface pour la table de routage
+                                let network_prefix = receiving_network.to_string(); // ex: "10.2.0.0/24"
                                 let broadcast_addr = crate::net_utils::calculate_broadcast_for_interface(&receiving_interface_ip, &receiving_network, crate::PORT)?;
                                 let seq_num = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                                     .as_secs() as u32;
-                                if let Err(e) = crate::lsa::send_lsa(&socket, &broadcast_addr, &receiving_interface_ip, 
-                                                        None, &receiving_interface_ip, std::sync::Arc::clone(&state), 
-                                                        seq_num, vec![receiving_interface_ip.clone()]).await {
+                                if let Err(e) = crate::lsa::send_lsa(&socket, &broadcast_addr, &network_prefix, 
+                                                        None, &network_prefix, std::sync::Arc::clone(&state), 
+                                                        seq_num, vec![network_prefix.clone()]).await {
                                     log::error!("Failed to send LSA after HELLO: {}", e);
                                 }
                             }
