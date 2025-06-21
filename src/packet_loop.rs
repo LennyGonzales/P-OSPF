@@ -1,3 +1,6 @@
+// Imports pour les macros de logging
+use log::{info, warn, debug, error};
+
 pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std::sync::Arc<crate::AppState>) -> crate::error::Result<()> {
     let mut buf = [0; 2048];
     let local_ips: std::collections::HashMap<std::net::IpAddr, (String, pnet::ipnetwork::IpNetwork)> = pnet::datalink::interfaces()
@@ -34,6 +37,12 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
                     match message_type {
                         1 => {
+                            // Vérifier si le protocole OSPF est activé avant de traiter les HELLO
+                            if !state.is_enabled().await {
+                                debug!("OSPF disabled, ignoring HELLO message");
+                                continue;
+                            }
+                            
                             if let Ok(hello) = serde_json::from_value::<crate::types::HelloMessage>(json) {
                                 log::info!("[RECV] HELLO from {} - {} (received on interface {})", 
                                     hello.router_ip, src_addr, receiving_interface_ip);
@@ -53,6 +62,12 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                             }
                         }
                         2 => {
+                            // Vérifier si le protocole OSPF est activé avant de traiter les LSA
+                            if !state.is_enabled().await {
+                                debug!("OSPF disabled, ignoring LSA message");
+                                continue;
+                            }
+                            
                             if let Ok(lsa) = serde_json::from_value::<crate::types::LSAMessage>(json) {
                                 log::info!("[RECV] LSA from {} (originator: {}, last_hop: {:?}, seq: {}) on interface {}", 
                                     src_addr, lsa.originator, lsa.last_hop, lsa.seq_num, receiving_interface_ip);
@@ -95,6 +110,24 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                 } else {
                                     log::debug!("LSA TTL expired, not forwarding");
                                 }
+                            }
+                        }
+                        3 => {
+                            // Message de contrôle : enable/disable
+                            if let Some(command) = json.get("command").and_then(|v| v.as_str()) {
+                                match command {
+                                    "enable" => {
+                                        state.enable().await;
+                                        info!("Protocole activé via commande réseau");
+                                    },
+                                    "disable" => {
+                                        state.disable().await;
+                                        info!("Protocole désactivé via commande réseau");
+                                    },
+                                    _ => warn!("Commande de contrôle inconnue: {}", command),
+                                }
+                            } else {
+                                warn!("Message de contrôle sans champ 'command'");
                             }
                         }
                         _ => log::warn!("Unknown message type: {}", message_type),

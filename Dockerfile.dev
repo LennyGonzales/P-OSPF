@@ -10,4 +10,4 @@ RUN rustup update
 
 WORKDIR /usr/src/app
 
-CMD ["cargo", "run"]
+CMD ["cargo", "run", "--bin", "routing"]

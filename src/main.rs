@@ -36,6 +36,26 @@ pub struct AppState {
     pub routing_table: Mutex<HashMap<String, (String, RouteState)>>,
     pub processed_lsa: Mutex<HashSet<(String, u32)>>,
     pub local_ip: String,
+    pub enabled: Mutex<bool>, // État d'activation du protocole OSPF
+}
+
+impl AppState {
+    /// Active le protocole OSPF
+    pub async fn enable(&self) {
+        let mut enabled = self.enabled.lock().await;
+        *enabled = true;
+    }
+    
+    /// Désactive le protocole OSPF
+    pub async fn disable(&self) {
+        let mut enabled = self.enabled.lock().await;
+        *enabled = false;
+    }
+    
+    /// Vérifie si le protocole OSPF est activé
+    pub async fn is_enabled(&self) -> bool {
+        *self.enabled.lock().await
+    }
 }
 
 const PORT: u16 = 5000;

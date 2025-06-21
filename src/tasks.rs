@@ -7,6 +7,11 @@ pub fn spawn_hello_and_lsa_tasks(socket: std::sync::Arc<tokio::net::UdpSocket>, 
         loop {
             tokio::select! {
                 _ = hello_interval.tick() => {
+                    // Vérifier si le protocole OSPF est activé avant d'envoyer des HELLO
+                    if !state_clone.is_enabled().await {
+                        continue;
+                    }
+                    
                     let broadcast_addrs = crate::net_utils::get_broadcast_addresses(crate::PORT);
                     for (local_ip, addr) in &broadcast_addrs {
                         if let Err(e) = crate::hello::send_hello(&socket_clone, addr, local_ip).await {
@@ -15,6 +20,11 @@ pub fn spawn_hello_and_lsa_tasks(socket: std::sync::Arc<tokio::net::UdpSocket>, 
                     }
                 }
                 _ = lsa_interval.tick() => {
+                    // Vérifier si le protocole OSPF est activé avant d'envoyer des LSA
+                    if !state_clone.is_enabled().await {
+                        continue;
+                    }
+                    
                     let broadcast_addrs = crate::net_utils::get_broadcast_addresses(crate::PORT);
                     for (local_ip, addr) in &broadcast_addrs {
                         let seq_num = std::time::SystemTime::now()
