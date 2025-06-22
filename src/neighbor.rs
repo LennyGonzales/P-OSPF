@@ -23,7 +23,7 @@ pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
             n.last_seen = current_time;
             n.capacity = capacity;
             // Le lien n'est considéré comme UP que si l'interface est active ET le voisin répond
-            let should_be_up = link_active && true; // true car on a reçu un message du voisin
+            let should_be_up = link_active; // true car on a reçu un message du voisin
             if n.link_up != should_be_up {
                 if should_be_up {
                     info!("Neighbor {} is now UP (capacity: {} Mbps)", neighbor_ip, capacity);
