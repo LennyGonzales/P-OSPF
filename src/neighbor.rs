@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use log::{info, warn, error};
 use crate::AppState;
 use std::time::Duration;
+use crate::dijkstra::calculate_ospf_cost; // Add this import
 
 use crate::net_utils::get_broadcast_addresses;
 
@@ -123,7 +124,7 @@ pub async fn display_interface_report(state: &Arc<AppState>) {
     
     for interface in &state.config.interfaces {
         let status = if interface.link_active { "ACTIF" } else { "INACTIF" };
-        let cost = calculate_ospf_cost(interface.link_active, interface.capacity_mbps);
+        let cost = calculate_ospf_cost(interface.capacity_mbps, interface.link_active);
         
         let cost_str = if cost == u32::MAX {
             "∞".to_string()
