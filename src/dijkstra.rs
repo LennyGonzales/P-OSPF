@@ -50,8 +50,9 @@ struct DijkstraNode {
 
 impl Ord for DijkstraNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Priorité : 1) Nombre de sauts minimum (plus court chemin), 2) Capacité goulot maximale
-        other.hop_count.cmp(&self.hop_count)
+        // Priorité : 1) Coût total minimum, 2) Nombre de sauts minimum (plus court chemin), 3) Capacité goulot maximale
+        other.total_cost.cmp(&self.total_cost)
+            .then_with(|| other.hop_count.cmp(&self.hop_count))
             .then_with(|| self.bottleneck_capacity.cmp(&other.bottleneck_capacity))
     }
 }
