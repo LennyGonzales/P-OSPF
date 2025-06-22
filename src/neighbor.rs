@@ -123,15 +123,7 @@ pub async fn display_interface_report(state: &Arc<AppState>) {
     
     for interface in &state.config.interfaces {
         let status = if interface.link_active { "ACTIF" } else { "INACTIF" };
-        let cost = if interface.link_active {
-            // Calculer le coût OSPF (100 Mbps de référence)
-            let reference_bandwidth = 100_000_000;
-            let bandwidth_bps = interface.capacity_mbps * 1_000_000;
-            let cost = reference_bandwidth / bandwidth_bps;
-            cost.max(1)
-        } else {
-            u32::MAX
-        };
+        let cost = calculate_ospf_cost(interface.link_active, interface.capacity_mbps);
         
         let cost_str = if cost == u32::MAX {
             "∞".to_string()
