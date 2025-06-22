@@ -7,6 +7,8 @@ mod init;
 mod tasks;
 mod packet_loop;
 mod hello;
+mod read_config;
+mod dijkstra;
 
 use error::*;
 use lsa::*;
@@ -37,6 +39,7 @@ pub struct AppState {
     pub processed_lsa: Mutex<HashSet<(String, u32)>>,
     pub local_ip: String,
     pub enabled: Mutex<bool>, // État d'activation du protocole OSPF
+    pub config: read_config::RouterConfig, // Configuration du routeur
 }
 
 impl AppState {
@@ -67,12 +70,24 @@ const INITIAL_TTL: u8 = 64;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     init_logging_and_env();
+    
+    // Charger la configuration basée sur le hostname
+    let config = read_config::read_router_config()?;
+    info!("Configuration chargée pour le routeur avec {} interfaces", config.interfaces.len());
+    
     let router_ip = get_local_ip()?;
     info!("Router IP: {}", router_ip);
     let socket = init_socket(PORT).await?;
-    let state = init_state(router_ip);
+    let state = init_state(router_ip, config);
+    
+    // Calculer les routes initiales
+    if let Err(e) = dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await {
+        warn!("Échec du calcul initial des routes: {}", e);
+    }
+    
     spawn_hello_and_lsa_tasks(std::sync::Arc::clone(&socket), std::sync::Arc::clone(&state));
     spawn_neighbor_timeout_task(std::sync::Arc::clone(&state));
+    
     main_loop(socket, state).await?;
     Ok(())
 }
