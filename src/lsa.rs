@@ -37,8 +37,21 @@ pub async fn send_lsa(
 
     let routing_table_guard = state.routing_table.lock().await;
     let mut route_states = HashMap::new();
-    for (dest, (_, state)) in routing_table_guard.iter() {
-        route_states.insert(dest.clone(), state.clone());
+    
+    // Pour chaque route, appliquer Split Horizon with Poison Reverse
+    let dest_addr_ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        _ => "unknown".to_string(),
+    };
+    
+    for (dest, (next_hop, state_val)) in routing_table_guard.iter() {
+        // Si la route passe par le destinataire de ce LSA, marquer comme inaccessible (poison reverse)
+        if next_hop == &dest_addr_ip {
+            route_states.insert(dest.clone(), RouteState::Unreachable);
+            log::debug!("Applying poison reverse for {} to neighbor {}", dest, dest_addr_ip);
+        } else {
+            route_states.insert(dest.clone(), state_val.clone());
+        }
     }
     drop(routing_table_guard);
     
@@ -83,9 +96,9 @@ pub async fn send_lsa(
         originator: originator.to_string(),
         seq_num,
         neighbor_count: neighbors_vec.len(),
-        neighbors: neighbors_vec,
-        routing_table: route_states,
-        path,
+        neighbors: neighbors_vec.clone(), // Ajouter .clone() ici
+        routing_table: route_states.clone(), // Ajouter .clone() ici
+        path: path.clone(), // Ajouter .clone() ici
         ttl: super::INITIAL_TTL,
     };
 
@@ -93,6 +106,42 @@ pub async fn send_lsa(
     socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
     info!("[SEND] LSA from {} (originator: {}, seq: {}) to {}", 
           router_ip, originator, seq_num, addr);
+    
+    // Pour chaque voisin à qui on envoie le LSA
+    let neighbors_guard = state.neighbors.lock().await;
+    for (neighbor_ip, neighbor) in neighbors_guard.iter() {
+        if neighbor.link_up {
+            // Créer une copie modifiée de la table de routage pour ce voisin
+            let mut neighbor_specific_routes = route_states.clone();
+            
+            // Pour chaque route qui passe par ce voisin, la marquer comme inaccessible (poison reverse)
+            let routing_table = state.routing_table.lock().await;
+            for (dest, (next_hop, _)) in routing_table.iter() {
+                if next_hop == neighbor_ip {
+                    neighbor_specific_routes.insert(dest.clone(), RouteState::Unreachable);
+                }
+            }
+            
+            // Envoyer cette version modifiée au voisin
+            let message = crate::types::LSAMessage {
+                message_type: 2,
+                router_ip: router_ip.to_string(),
+                last_hop: last_hop.map(|s| s.to_string()),
+                originator: originator.to_string(),
+                seq_num,
+                neighbor_count: neighbors_vec.len(),
+                neighbors: neighbors_vec.clone(),
+                routing_table: neighbor_specific_routes,
+                path: path.clone(),
+                ttl: super::INITIAL_TTL,
+            };
+            let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
+            socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
+            info!("[SEND-POISON] LSA from {} (originator: {}, seq: {}) to {}", 
+                  router_ip, originator, seq_num, addr);
+        }
+    }
+    
     Ok(())
 }
 
