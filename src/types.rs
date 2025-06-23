@@ -97,3 +97,72 @@ impl InterfaceState {
         cost.max(1) // Le coût minimum est 1
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct RouteHistory {
+    pub last_change_time: u64,
+    pub flap_count: u32,
+    pub penalty: f64,
+    pub suppressed: bool,
+    pub current_route: Option<(String, RouteState)>,
+}
+
+impl RouteHistory {
+    pub fn new() -> Self {
+        Self {
+            last_change_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+                .as_secs(),
+            flap_count: 0,
+            penalty: 0.0,
+            suppressed: false,
+            current_route: None,
+        }
+    }
+    
+    pub fn record_change(&mut self, current_time: u64) {
+        let time_since_last_change = current_time.saturating_sub(self.last_change_time);
+        
+        // Appliquer une pénalité plus forte pour les changements rapides
+        if time_since_last_change < 30 {
+            self.penalty += 1000.0;
+        } else if time_since_last_change < 60 {
+            self.penalty += 500.0;
+        } else {
+            self.penalty += 100.0;
+        }
+        
+        self.flap_count += 1;
+        self.last_change_time = current_time;
+        
+        // Supprimer la route si trop instable
+        if self.penalty > 2000.0 {
+            self.suppressed = true;
+        }
+    }
+    
+    pub fn decay_penalty(&mut self, current_time: u64) {
+        let time_since_last_change = current_time.saturating_sub(self.last_change_time);
+        
+        // Diminution exponentielle de la pénalité avec le temps
+        if time_since_last_change > 0 {
+            let decay_factor = std::f64::consts::E.powf(-(time_since_last_change as f64) / 300.0);
+            self.penalty *= decay_factor;
+            
+            if self.penalty < 750.0 && self.suppressed {
+                self.suppressed = false;
+            }
+            
+            if self.penalty < 100.0 {
+                self.flap_count = 0;
+                self.penalty = 0.0;
+            }
+        }
+    }
+    
+    pub fn is_stable(&self, min_stable_time: u64, current_time: u64) -> bool {
+        let time_since_last_change = current_time.saturating_sub(self.last_change_time);
+        time_since_last_change >= min_stable_time && !self.suppressed
+    }
+}

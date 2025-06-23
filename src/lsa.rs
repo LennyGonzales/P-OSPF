@@ -181,28 +181,78 @@ pub async fn update_routing_from_lsa(
     socket: &tokio::net::UdpSocket
 ) -> crate::error::Result<()> {
     let mut routing_table = state.routing_table.lock().await;
+    let mut route_history = state.route_history.lock().await;
     let next_hop = sender_ip.to_string();
+    
+    // Temps actuel pour les calculs de stabilité
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+    
     if lsa.originator != state.local_ip {
+        // Obtenir ou créer l'historique de cette route
+        let route_history_entry = route_history.entry(lsa.originator.clone())
+            .or_insert_with(|| crate::types::RouteHistory::new());
+            
+        // Réduire la pénalité avec le temps
+        route_history_entry.decay_penalty(current_time);
+        
+        // Vérifier si la route est stable
+        let min_stable_time = 60; // 60 secondes minimum de stabilité
+        if !route_history_entry.is_stable(min_stable_time, current_time) {
+            debug!("Route vers {} instable (pénalité: {:.2}), ignoré", 
+                   lsa.originator, route_history_entry.penalty);
+            return Ok(());
+        }
+        
         let existing_entry = routing_table.get(&lsa.originator);
+        
+        // Logique d'hystérèse améliorée
         let should_update = match existing_entry {
-            Some((_, crate::types::RouteState::Active(current_metric))) => {
+            Some((existing_next_hop, crate::types::RouteState::Active(current_metric))) => {
                 match lsa.routing_table.get(&lsa.originator) {
-                    Some(crate::types::RouteState::Active(new_metric)) => new_metric < current_metric,
+                    Some(crate::types::RouteState::Active(raw_new_metric)) => {
+                        let new_metric = raw_new_metric + 1;
+                        
+                        // HYSTÉRÈSE: ne changer que si significativement meilleure (20% ou plus)
+                        if new_metric < *current_metric {
+                            let improvement = (*current_metric as f64 - new_metric as f64) / *current_metric as f64;
+                            if improvement > 0.20 {  // Minimum 20% d'amélioration
+                                info!("Route significativement meilleure trouvée ({:.1}% d'amélioration)",
+                                     improvement * 100.0);
+                                true
+                            } else {
+                                debug!("Amélioration insuffisante ({:.1}%), route conservée", 
+                                      improvement * 100.0);
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    },
                     _ => false,
                 }
             },
             Some((_, crate::types::RouteState::Unreachable)) => true,
             None => true,
         };
+        
         if should_update {
             let metric = match lsa.routing_table.get(&lsa.originator) {
                 Some(crate::types::RouteState::Active(m)) => *m + 1,
                 _ => 1,
             };
+            
+            // Enregistrer le changement
+            route_history_entry.record_change(current_time);
+            route_history_entry.current_route = Some((next_hop.clone(), crate::types::RouteState::Active(metric)));
+            
             routing_table.insert(lsa.originator.clone(), (next_hop.clone(), crate::types::RouteState::Active(metric)));
-            info!("Updated route: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
+            info!("Route mise à jour: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
+            
             if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
-                warn!("Could not update system routing table for {}: {}", lsa.originator, e);
+                warn!("Impossible de mettre à jour la table système pour {}: {}", lsa.originator, e);
             }
         }
     }

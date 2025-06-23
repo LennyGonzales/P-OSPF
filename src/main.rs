@@ -24,6 +24,7 @@ use log::{debug, error, info, warn};
 use pnet::ipnetwork::IpNetwork;
 use std::error::Error as StdError;
 use std::fmt;
+use crate::types::RouteHistory;
 use crate::types::{Neighbor, Router, LSAMessage, RouteState, HelloMessage};
 use crate::neighbor::{update_neighbor, check_neighbor_timeouts};
 use init::{init_logging_and_env, init_socket, init_state};
@@ -38,8 +39,10 @@ pub struct AppState {
     pub routing_table: Mutex<HashMap<String, (String, RouteState)>>,
     pub processed_lsa: Mutex<HashSet<(String, u32)>>,
     pub local_ip: String,
-    pub enabled: Mutex<bool>, // État d'activation du protocole OSPF
-    pub config: read_config::RouterConfig, // Configuration du routeur
+    pub enabled: Mutex<bool>,
+    pub config: read_config::RouterConfig,
+    // Ajouter l'historique des routes
+    pub route_history: Mutex<HashMap<String, RouteHistory>>,
 }
 
 impl AppState {

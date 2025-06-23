@@ -229,18 +229,23 @@ pub struct RouteInfo {
 /// Calcule le coût OSPF basé sur la capacité et l'état
 pub fn calculate_ospf_cost(capacity_mbps: u32, is_active: bool) -> u32 {
     if !is_active {
-        return u32::MAX; // Coût infini pour les liens inactifs
+        return u32::MAX;
     }
     
     if capacity_mbps == 0 {
         return u32::MAX;
     }
     
-    // Formule OSPF standard : 100 Mbps de référence
-    let reference_bandwidth = 100_000_000; // 100 Mbps en bps
+    // Formule améliorée avec échelle logarithmique pour mieux différencier les capacités
+    let reference_bandwidth = 100_000_000; // 100 Mbps
     let bandwidth_bps = capacity_mbps * 1_000_000;
-    let cost = reference_bandwidth / bandwidth_bps;
-    cost.max(1) // Coût minimum de 1
+    
+    // Utiliser une échelle logarithmique pour amplifier les différences entre liens
+    let log_factor = (reference_bandwidth as f64 / bandwidth_bps as f64).log10() * 10.0;
+    
+    // Assurer que le coût reste dans une plage raisonnable
+    let cost = (log_factor.max(0.0) * 10.0) as u32;
+    cost.max(1).min(65535)
 }
 
 /// Construit la topologie réseau à partir de l'état OSPF
