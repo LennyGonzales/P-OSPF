@@ -1,9 +1,9 @@
 [[interfaces]]
 name = "eth0"
-capacity_mbps = 1000
+capacity_mbps = 1000    # R_1 and R_2
 link_active = true
 
 [[interfaces]]
 name = "eth1"
-capacity_mbps = 1000
+capacity_mbps = 1000    # R_2 and R_5
 link_active = true

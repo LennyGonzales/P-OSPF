@@ -13,8 +13,10 @@ services:
     networks:
       N_A1:
         ipv4_address: 192.168.1.1
+        priority: 1000
       N_C1:
         ipv4_address: 10.1.0.1
+        priority: 900
     cap_add:
       - NET_ADMIN
 
@@ -28,12 +30,12 @@ services:
       - ./:/usr/src/app
       - cargo_target:/usr/src/app/target
     networks:
-      N_A2:
-        ipv4_address: 192.168.2.1
       N_C1:
         ipv4_address: 10.1.0.2
       N_C2:
         ipv4_address: 10.2.0.2
+      N_A2:
+        ipv4_address: 192.168.2.1
     cap_add:
       - NET_ADMIN
 
@@ -49,8 +51,10 @@ services:
     networks:
       N_A3:
         ipv4_address: 192.168.3.1
+        priority: 1000
       N_C3:
         ipv4_address: 10.3.0.3
+        priority: 900
     cap_add:
       - NET_ADMIN
 
@@ -66,8 +70,10 @@ services:
     networks:
       N_C1:
         ipv4_address: 10.1.0.4
+        priority: 1000
       N_C2:
         ipv4_address: 10.2.0.4
+        priority: 900
     cap_add:
       - NET_ADMIN
 
@@ -83,8 +89,10 @@ services:
     networks:
       N_C2:
         ipv4_address: 10.2.0.5
+        priority: 1000
       N_C3:
         ipv4_address: 10.3.0.5
+        priority: 900
     cap_add:
       - NET_ADMIN
 

@@ -1,9 +1,9 @@
 [[interfaces]]
 name = "eth0"
-capacity_mbps = 1000  # Lien rapide vers R_1
+capacity_mbps = 1000  # t_A3
 link_active = true
 
 [[interfaces]]
 name = "eth1"
-capacity_mbps = 10    # Lien très lent vers R_5 (backup)
+capacity_mbps = 1000    # R_5
 link_active = true
