@@ -1,9 +1,11 @@
 [[interfaces]]
 name = "eth0"
-capacity_mbps = 1000  # Lien rapide vers R_3
+capacity_mbps = 1000
 link_active = true
+# eth0 : vers le réseau 192.168.1.0/24 (LAN A1) et t_a1
 
 [[interfaces]]
 name = "eth1"
-capacity_mbps = 100   # Lien plus lent vers R_4
+capacity_mbps = 100
 link_active = true
+# eth1 : vers le réseau 10.1.0.0/24 (vers R2 et R4)

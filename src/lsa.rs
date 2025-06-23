@@ -200,7 +200,22 @@ pub async fn update_routing_from_lsa(
                 let existing_entry = routing_table.get(dest);
                 let new_metric = metric + 1;
                 let should_update = match existing_entry {
-                    Some((_, crate::types::RouteState::Active(current_metric))) => new_metric < *current_metric,
+                    Some((current_next_hop, crate::types::RouteState::Active(current_metric))) => {
+                        if new_metric < *current_metric {
+                            true
+                        } else if new_metric == *current_metric {
+                            // Même coût, NE PAS changer de next-hop sauf si l'actuel n'est plus un voisin actif
+                            // Vérifier si le next-hop actuel est toujours un voisin actif
+                            let neighbors_guard = state.neighbors.lock().await;
+                            let still_active = neighbors_guard.get(current_next_hop)
+                                .map(|n| n.link_up)
+                                .unwrap_or(false);
+                            drop(neighbors_guard);
+                            !still_active // On met à jour SEULEMENT si l'ancien next-hop n'est plus actif
+                        } else {
+                            false
+                        }
+                    },
                     Some((_, crate::types::RouteState::Unreachable)) => true,
                     None => true,
                 };
@@ -210,6 +225,8 @@ pub async fn update_routing_from_lsa(
                     if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
                         warn!("Could not update system routing table for {}: {}", dest, e);
                     }
+                } else {
+                    debug!("Route to {} not updated (same or worse metric, or would cause flapping)", dest);
                 }
             },
             crate::types::RouteState::Unreachable => {

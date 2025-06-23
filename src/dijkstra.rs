@@ -236,8 +236,8 @@ pub fn calculate_ospf_cost(capacity_mbps: u32, is_active: bool) -> u32 {
         return u32::MAX;
     }
     
-    // Formule OSPF standard : 100 Mbps de référence
-    let reference_bandwidth = 100_000_000; // 100 Mbps en bps
+    // Formule OSPF modifiée : 1 Gbps de référence
+    let reference_bandwidth = 1_000_000_000; // 1 Gbps en bps
     let bandwidth_bps = capacity_mbps * 1_000_000;
     let cost = reference_bandwidth / bandwidth_bps;
     cost.max(1) // Coût minimum de 1

@@ -2,8 +2,10 @@
 name = "eth0"
 capacity_mbps = 1000
 link_active = true
+# eth0 : vers le réseau 10.2.0.0/24 (vers R2, R4)
 
 [[interfaces]]
 name = "eth1"
 capacity_mbps = 1000
 link_active = true
+# eth1 : vers le réseau 10.3.0.0/24 (vers R3)
