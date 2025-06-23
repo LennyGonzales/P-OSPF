@@ -50,7 +50,7 @@ struct DijkstraNode {
 
 impl Ord for DijkstraNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Priorité : 1) Coût total minimum, 2) Nombre de sauts minimum (plus court chemin), 3) Capacité goulot maximale
+        // Priorité : 1) Coût OSPF total minimum, 2) Nombre de sauts minimum, 3) Capacité goulot maximale
         other.total_cost.cmp(&self.total_cost)
             .then_with(|| other.hop_count.cmp(&self.hop_count))
             .then_with(|| self.bottleneck_capacity.cmp(&other.bottleneck_capacity))
@@ -121,40 +121,30 @@ impl NetworkTopology {
     }
 
     /// Calcule les meilleurs chemins depuis un routeur source
-    /// Basé sur : 1) Plus court chemin (nombre de sauts), 2) Capacité goulot, 3) État des liens
+    /// Basé sur : 1) Coût OSPF total, 2) Nombre de sauts, 3) Capacité goulot
     pub fn calculate_shortest_paths(&self, source: &str) -> HashMap<String, RouteInfo> {
-        let mut hop_counts: HashMap<String, u32> = HashMap::new();
-        let mut bottleneck_capacities: HashMap<String, u32> = HashMap::new();
-        let mut paths: HashMap<String, Vec<String>> = HashMap::new();
+        // Stocke le meilleur chemin connu pour chaque destination
+        let mut best_paths: HashMap<String, DijkstraNode> = HashMap::new();
         let mut visited = HashSet::new();
         let mut heap = BinaryHeap::new();
 
-        // Initialisation
-        for node_id in self.nodes.keys() {
-            hop_counts.insert(node_id.clone(), u32::MAX);
-            bottleneck_capacities.insert(node_id.clone(), 0);
-            paths.insert(node_id.clone(), Vec::new());
-        }
-
-        // Nœud source
-        hop_counts.insert(source.to_string(), 0);
-        bottleneck_capacities.insert(source.to_string(), u32::MAX);
-        paths.insert(source.to_string(), vec![source.to_string()]);
-
-        heap.push(DijkstraNode {
+        // Initialisation avec le nœud source
+        let source_node = DijkstraNode {
             router_id: source.to_string(),
             total_cost: 0,
             hop_count: 0,
             bottleneck_capacity: u32::MAX,
             path: vec![source.to_string()],
-        });
+        };
+        heap.push(source_node.clone());
+        best_paths.insert(source.to_string(), source_node);
 
-        // Algorithme modifié pour la capacité goulot d'étranglement
+        // Algorithme de Dijkstra
         while let Some(current) = heap.pop() {
-            if visited.contains(&current.router_id) {
+            // Si le nœud a déjà été visité, son chemin optimal est déjà trouvé.
+            if !visited.insert(current.router_id.clone()) {
                 continue;
             }
-            visited.insert(current.router_id.clone());
 
             // Explorer les voisins
             for link in self.get_active_neighbors(&current.router_id) {
@@ -162,49 +152,44 @@ impl NetworkTopology {
                     continue;
                 }
 
-                let new_hop_count = current.hop_count + 1;
-                let new_bottleneck_capacity = current.bottleneck_capacity.min(link.capacity_mbps);
-                
-                let current_best_hops = *hop_counts.get(&link.to).unwrap_or(&u32::MAX);
-                let current_best_capacity = *bottleneck_capacities.get(&link.to).unwrap_or(&0);
+                let mut new_path = current.path.clone();
+                new_path.push(link.to.clone());
 
-                // Critères de mise à jour : nombre de sauts principal, puis capacité goulot
-                let should_update = new_hop_count < current_best_hops ||
-                    (new_hop_count == current_best_hops && new_bottleneck_capacity > current_best_capacity);
+                let new_node = DijkstraNode {
+                    router_id: link.to.clone(),
+                    total_cost: current.total_cost.saturating_add(link.cost),
+                    hop_count: current.hop_count + 1,
+                    bottleneck_capacity: current.bottleneck_capacity.min(link.capacity_mbps),
+                    path: new_path,
+                };
+
+                let should_update = match best_paths.get(&link.to) {
+                    // Mettre à jour si le nouveau chemin est meilleur (selon les critères de `cmp`)
+                    Some(existing_node) => new_node.cmp(existing_node) == Ordering::Greater,
+                    // Ou si aucun chemin n'était connu pour cette destination
+                    None => true,
+                };
 
                 if should_update {
-                    hop_counts.insert(link.to.clone(), new_hop_count);
-                    bottleneck_capacities.insert(link.to.clone(), new_bottleneck_capacity);
-                    
-                    let mut new_path = current.path.clone();
-                    new_path.push(link.to.clone());
-                    paths.insert(link.to.clone(), new_path.clone());
-
-                    heap.push(DijkstraNode {
-                        router_id: link.to.clone(),
-                        total_cost: new_hop_count,
-                        hop_count: new_hop_count,
-                        bottleneck_capacity: new_bottleneck_capacity,
-                        path: new_path,
-                    });
+                    heap.push(new_node.clone());
+                    best_paths.insert(link.to.clone(), new_node);
                 }
             }
         }
 
-        // Construire les résultats
+        // Construire les résultats finaux
         let mut routes = HashMap::new();
-        for (dest, hops) in hop_counts {
-            if dest != source && hops != u32::MAX {
-                let path = paths.get(&dest).unwrap_or(&Vec::new()).clone();
-                let next_hop = if path.len() > 1 { path[1].clone() } else { dest.clone() };
+        for (dest, node) in best_paths {
+            if dest != source {
+                let next_hop = if node.path.len() > 1 { node.path[1].clone() } else { dest.clone() };
                 
                 routes.insert(dest.clone(), RouteInfo {
-                    destination: dest.clone(),
+                    destination: dest,
                     next_hop,
-                    total_cost: hops,
-                    hop_count: hops,
-                    bottleneck_capacity: *bottleneck_capacities.get(&dest).unwrap_or(&0),
-                    path,
+                    total_cost: node.total_cost,
+                    hop_count: node.hop_count,
+                    bottleneck_capacity: node.bottleneck_capacity,
+                    path: node.path,
                     is_reachable: true,
                 });
             }
