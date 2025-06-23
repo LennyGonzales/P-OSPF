@@ -2,13 +2,16 @@
 name = "eth0"
 capacity_mbps = 500
 link_active = true
+# eth0 : vers le réseau 192.168.2.0/24 (LAN A2) et t_a2
 
 [[interfaces]]
 name = "eth1"
 capacity_mbps = 100
 link_active = true
+# eth1 : vers le réseau 10.1.0.0/24 (vers R1 et R4)
 
 [[interfaces]]
 name = "eth2"
 capacity_mbps = 100
 link_active = true
+# eth2 : vers le réseau 10.2.0.0/24 (vers R5 et R4)
