@@ -89,7 +89,7 @@ pub async fn send_lsa(
         ttl: super::INITIAL_TTL,
     };
 
-    crate::net_utils::send_message(socket, addr, &message, "[SEND] LSA").await
+    crate::net_utils::send_message(socket, addr, &message, state.key.as_slice(),"[SEND] LSA").await
 }
 
 pub async fn forward_lsa(

@@ -20,5 +20,6 @@ pub fn init_state(router_ip: String, config: crate::read_config::RouterConfig) -
         local_ip: router_ip,
         enabled: tokio::sync::Mutex::new(true), // OSPF activé par défaut
         config,
+        key: Default::default(),
     })
 }

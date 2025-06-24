@@ -122,7 +122,7 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                     "connexion" => {
                                         log::info!("[CLI] New connection from {}", src_addr);
                                         let response = "Connexion établie avec succès";
-                                        if let Err(e) = crate::net_utils::send_text_response(&socket, &src_addr, response, "connexion").await {
+                                        if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &response, state.key.as_slice(), "[CLI]").await {
                                             log::warn!("{}", e);
                                         }
                                     },
@@ -130,16 +130,16 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                         state.enable().await;
                                         log::info!("[CLI] Protocole activé via commande réseau");
                                         let response = "Protocole OSPF activé";
-                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
-                                            log::warn!("[CLI] Failed to send enable confirmation: {}", e);
+                                        if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &response, state.key.as_slice(), "[CLI]").await {
+                                            log::warn!("{}", e);
                                         }
                                     },
                                     "disable" => {
                                         state.disable().await;
                                         log::info!("[CLI] Protocole désactivé via commande réseau");
                                         let response = "Protocole OSPF désactivé";
-                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
-                                            log::warn!("[CLI] Failed to send disable confirmation: {}", e);
+                                        if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &response, state.key.as_slice(), "[CLI]").await {
+                                            log::warn!("{}", e);
                                         }
                                     },
                                     "routing-table" => {
@@ -153,7 +153,7 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                                 .join("\n")
                                         };
                                         log::info!("[CLI] Routing table requested, sending to {}", src_addr);
-                                        if let Err(e) = socket.send_to(table_str.as_bytes(), src_addr).await {
+                                        if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &table_str, state.key.as_slice(), "[CLI]").await {
                                             log::warn!("[CLI] Failed to send routing table: {}", e);
                                         }
                                     },
@@ -175,14 +175,14 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                                 .join("\n")
                                         };
                                         log::info!("[CLI] Neighbors list requested, sending to {}", src_addr);
-                                        if let Err(e) = socket.send_to(neighbors_str.as_bytes(), src_addr).await {
+                                        if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &neighbors_str, state.key.as_slice(), "[CLI]").await {
                                             log::warn!("[CLI] Failed to send neighbors list: {}", e);
                                         }
                                     },
                                     _ => {
                                         log::warn!("[CLI] Commande de contrôle inconnue: {}", command);
                                         let response = format!("Commande inconnue: '{}'. Utilisez 'help' pour voir les commandes disponibles.", command);
-                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                        if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &response, state.key.as_slice(), "[CLI]").await {
                                             log::warn!("[CLI] Failed to send error response: {}", e);
                                         }
                                     }
@@ -190,7 +190,7 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                             } else {
                                 log::warn!("[CLI] Message de contrôle sans champ 'command'");
                                 let response = "Erreur: message de contrôle sans commande";
-                                if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
+                                if let Err(e) = crate::net_utils::send_message(&socket, &src_addr, &response, state.key.as_slice(), "[CLI]").await {
                                     log::warn!("[CLI] Failed to send error response: {}", e);
                                 }
                             }

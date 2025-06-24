@@ -109,22 +109,6 @@ pub async fn send_message<T: serde::Serialize>(
     Ok(())
 }
 
-/// Fonction d'aide pour envoyer un message texte simple (réponses CLI)
-pub async fn send_text_response(
-    socket: &tokio::net::UdpSocket,
-    addr: &std::net::SocketAddr,
-    response: &str,
-    log_context: &str
-) -> crate::error::Result<()> {
-    socket.send_to(response.as_bytes(), addr).await
-        .map_err(|e| crate::error::AppError::NetworkError(
-            format!("Failed to send {} response: {}", log_context, e)
-        ))?;
-    
-    log::debug!("[CLI] Sent {} response to {}", log_context, addr);
-    Ok(())
-}
-
 /// Chiffre les données en utilisant AES-256-CBC et génère un IV aléatoire.
 ///
 /// # Arguments

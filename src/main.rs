@@ -38,8 +38,9 @@ pub struct AppState {
     pub routing_table: Mutex<HashMap<String, (String, RouteState)>>,
     pub processed_lsa: Mutex<HashSet<(String, u32)>>,
     pub local_ip: String,
-    pub enabled: Mutex<bool>, // État d'activation du protocole OSPF
-    pub config: read_config::RouterConfig, // Configuration du routeur
+    pub enabled: Mutex<bool>,
+    pub config: read_config::RouterConfig,
+    pub key: Vec<u8>,
 }
 
 impl AppState {
@@ -78,15 +79,28 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let router_ip = get_local_ip()?;
     info!("Router IP: {}", router_ip);
     let socket = init_socket(PORT).await?;
-    let state = init_state(router_ip, config);
+    let key = config.key
+        .as_ref()
+        .map(|k| base64::decode(k).unwrap_or_else(|_| k.as_bytes().to_vec()))
+        .unwrap_or_else(|| vec![0u8; 32]); // fallback si pas de clé
+    let state = Arc::new(AppState {
+        topology: Mutex::new(HashMap::new()),
+        neighbors: Mutex::new(HashMap::new()),
+        routing_table: Mutex::new(HashMap::new()),
+        processed_lsa: Mutex::new(HashSet::new()),
+        local_ip: router_ip.clone(),
+        enabled: Mutex::new(false),
+        config,
+        key,
+    });
     
     // Calculer les routes initiales
-    if let Err(e) = dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await {
+    if let Err(e) = dijkstra::calculate_and_update_optimal_routes(Arc::clone(&state)).await {
         warn!("Échec du calcul initial des routes: {}", e);
     }
     
-    spawn_hello_and_lsa_tasks(std::sync::Arc::clone(&socket), std::sync::Arc::clone(&state));
-    spawn_neighbor_timeout_task(std::sync::Arc::clone(&state));
+    spawn_hello_and_lsa_tasks(Arc::clone(&socket), Arc::clone(&state));
+    spawn_neighbor_timeout_task(Arc::clone(&state));
     
     main_loop(socket, state).await?;
     Ok(())

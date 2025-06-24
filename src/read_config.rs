@@ -21,6 +21,8 @@ fn default_link_active() -> bool {
 pub struct RouterConfig {
     #[serde(default)]
     pub interfaces: Vec<InterfaceConfig>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// Lit la configuration du routeur basée sur le hostname

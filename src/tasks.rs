@@ -14,7 +14,7 @@ pub fn spawn_hello_and_lsa_tasks(socket: std::sync::Arc<tokio::net::UdpSocket>, 
                     
                     let broadcast_addrs = crate::net_utils::get_broadcast_addresses(crate::PORT);
                     for (local_ip, addr) in &broadcast_addrs {
-                        if let Err(e) = crate::hello::send_hello(&socket_clone, addr, local_ip).await {
+                        if let Err(e) = crate::hello::send_hello(&socket_clone, addr, local_ip, state.key.as_slice()).await {
                             log::error!("Failed to send hello to {}: {}", addr, e);
                         }
                     }
