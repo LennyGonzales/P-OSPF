@@ -50,10 +50,9 @@ struct DijkstraNode {
 
 impl Ord for DijkstraNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Priorité : 1) Coût total minimum, 2) Nombre de sauts minimum (plus court chemin), 3) Capacité goulot maximale
-        other.total_cost.cmp(&self.total_cost)
-            .then_with(|| other.hop_count.cmp(&self.hop_count))
-            .then_with(|| self.bottleneck_capacity.cmp(&other.bottleneck_capacity))
+        // Priorité simplifiée : 1) Nombre de sauts minimum (plus court chemin), 2) Router ID pour consistance
+        other.hop_count.cmp(&self.hop_count)
+            .then_with(|| self.router_id.cmp(&other.router_id))
     }
 }
 
@@ -89,15 +88,13 @@ impl NetworkTopology {
     }
 
     /// Ajoute un lien bidirectionnel entre deux routeurs
-    pub fn add_link(&mut self, from: String, to: String, capacity_mbps: u32, is_active: bool) {
-        let cost = calculate_ospf_cost(capacity_mbps, is_active);
-        
+    pub fn add_link(&mut self, from: String, to: String, is_active: bool) {
         // Lien direct
         self.links.push(NetworkLink {
             from: from.clone(),
             to: to.clone(),
-            cost,
-            capacity_mbps,
+            cost: if is_active { 1 } else { u32::MAX }, // Coût simplifié : 1 si actif, infini si inactif
+            capacity_mbps: 100, // Valeur par défaut, ignorée pour l'instant
             is_active,
             hop_count: 1,
         });
@@ -106,8 +103,8 @@ impl NetworkTopology {
         self.links.push(NetworkLink {
             from: to,
             to: from,
-            cost,
-            capacity_mbps,
+            cost: if is_active { 1 } else { u32::MAX },
+            capacity_mbps: 100,
             is_active,
             hop_count: 1,
         });
@@ -121,60 +118,50 @@ impl NetworkTopology {
     }
 
     /// Calcule les meilleurs chemins depuis un routeur source
-    /// Basé sur : 1) Plus court chemin (nombre de sauts), 2) Capacité goulot, 3) État des liens
+    /// Basé sur le nombre de sauts minimum et l'état des liens
     pub fn calculate_shortest_paths(&self, source: &str) -> HashMap<String, RouteInfo> {
-        let mut hop_counts: HashMap<String, u32> = HashMap::new();
-        let mut bottleneck_capacities: HashMap<String, u32> = HashMap::new();
+        let mut distances: HashMap<String, u32> = HashMap::new();
         let mut paths: HashMap<String, Vec<String>> = HashMap::new();
         let mut visited = HashSet::new();
         let mut heap = BinaryHeap::new();
 
-        // Initialisation
+        // Initialisation - tous les nœuds à distance infinie
         for node_id in self.nodes.keys() {
-            hop_counts.insert(node_id.clone(), u32::MAX);
-            bottleneck_capacities.insert(node_id.clone(), 0);
+            distances.insert(node_id.clone(), u32::MAX);
             paths.insert(node_id.clone(), Vec::new());
         }
 
-        // Nœud source
-        hop_counts.insert(source.to_string(), 0);
-        bottleneck_capacities.insert(source.to_string(), u32::MAX);
+        // Nœud source à distance 0
+        distances.insert(source.to_string(), 0);
         paths.insert(source.to_string(), vec![source.to_string()]);
 
         heap.push(DijkstraNode {
             router_id: source.to_string(),
             total_cost: 0,
             hop_count: 0,
-            bottleneck_capacity: u32::MAX,
+            bottleneck_capacity: u32::MAX, // Ignoré pour l'instant
             path: vec![source.to_string()],
         });
 
-        // Algorithme modifié pour la capacité goulot d'étranglement
+        // Algorithme de Dijkstra modifié pour le nombre de sauts
         while let Some(current) = heap.pop() {
             if visited.contains(&current.router_id) {
                 continue;
             }
             visited.insert(current.router_id.clone());
 
-            // Explorer les voisins
+            // Explorer les voisins actifs
             for link in self.get_active_neighbors(&current.router_id) {
-                if visited.contains(&link.to) {
+                if visited.contains(&link.to) || !link.is_active {
                     continue;
                 }
 
-                let new_hop_count = current.hop_count + 1;
-                let new_bottleneck_capacity = current.bottleneck_capacity.min(link.capacity_mbps);
-                
-                let current_best_hops = *hop_counts.get(&link.to).unwrap_or(&u32::MAX);
-                let current_best_capacity = *bottleneck_capacities.get(&link.to).unwrap_or(&0);
+                let new_distance = current.hop_count + 1;
+                let current_best_distance = *distances.get(&link.to).unwrap_or(&u32::MAX);
 
-                // Critères de mise à jour : nombre de sauts principal, puis capacité goulot
-                let should_update = new_hop_count < current_best_hops ||
-                    (new_hop_count == current_best_hops && new_bottleneck_capacity > current_best_capacity);
-
-                if should_update {
-                    hop_counts.insert(link.to.clone(), new_hop_count);
-                    bottleneck_capacities.insert(link.to.clone(), new_bottleneck_capacity);
+                // Mise à jour si on trouve un chemin plus court
+                if new_distance < current_best_distance {
+                    distances.insert(link.to.clone(), new_distance);
                     
                     let mut new_path = current.path.clone();
                     new_path.push(link.to.clone());
@@ -182,9 +169,9 @@ impl NetworkTopology {
 
                     heap.push(DijkstraNode {
                         router_id: link.to.clone(),
-                        total_cost: new_hop_count,
-                        hop_count: new_hop_count,
-                        bottleneck_capacity: new_bottleneck_capacity,
+                        total_cost: new_distance,
+                        hop_count: new_distance,
+                        bottleneck_capacity: 0, // Ignoré pour l'instant
                         path: new_path,
                     });
                 }
@@ -193,21 +180,27 @@ impl NetworkTopology {
 
         // Construire les résultats
         let mut routes = HashMap::new();
-        for (dest, hops) in hop_counts {
-            if dest != source && hops != u32::MAX {
+        for (dest, distance) in distances {
+            if dest != source && distance != u32::MAX {
                 let path = paths.get(&dest).unwrap_or(&Vec::new()).clone();
                 let next_hop = if path.len() > 1 { path[1].clone() } else { dest.clone() };
                 
                 routes.insert(dest.clone(), RouteInfo {
                     destination: dest.clone(),
                     next_hop,
-                    total_cost: hops,
-                    hop_count: hops,
-                    bottleneck_capacity: *bottleneck_capacities.get(&dest).unwrap_or(&0),
+                    total_cost: distance,
+                    hop_count: distance,
+                    bottleneck_capacity: 0, // Ignoré pour l'instant
                     path,
                     is_reachable: true,
                 });
             }
+        }
+
+        debug!("Chemins calculés depuis {} : {} destinations atteignables", source, routes.len());
+        for (dest, route) in &routes {
+            debug!("Route vers {} : {} sauts via {} (chemin: {:?})", 
+                dest, route.hop_count, route.next_hop, route.path);
         }
 
         routes
@@ -273,8 +266,7 @@ pub async fn build_network_topology(state: Arc<AppState>) -> NetworkTopology {
             topology.add_link(
                 state.local_ip.clone(),
                 neighbor_ip.clone(),
-                neighbor.capacity,
-                true,
+                true, // Lien actif
             );
         }
     }
@@ -325,5 +317,188 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
 async fn update_system_route(destination: &str, gateway: &str) -> Result<()> {
     // Implémentation simplifiée - dans un vrai système, utiliser netlink ou ip route
     debug!("Route système: {} via {}", destination, gateway);
+    Ok(())
+}
+
+/// Calcule les meilleurs chemins vers tous les réseaux IP connus
+pub async fn calculate_best_paths_to_networks(state: Arc<AppState>) -> Result<HashMap<String, NetworkPathInfo>> {
+    debug!("Calcul des meilleurs chemins vers tous les réseaux IP...");
+    
+    // Construire la topologie réseau
+    let topology = build_network_topology(Arc::clone(&state)).await;
+    
+    // Obtenir les réseaux locaux
+    let local_networks = crate::net_utils::get_local_networks()?;
+    
+    // Calculer les chemins depuis le routeur local vers tous les autres routeurs
+    let routes = topology.calculate_shortest_paths(&state.local_ip);
+    
+    let mut network_paths = HashMap::new();
+    
+    // Ajouter les réseaux directement connectés (distance 0)
+    for (network_cidr, (interface_name, ip_network)) in &local_networks {
+        network_paths.insert(network_cidr.clone(), NetworkPathInfo {
+            network_cidr: network_cidr.clone(),
+            next_hop: None, // Directement connecté
+            hop_count: 0,
+            path: vec![state.local_ip.clone()],
+            is_reachable: true,
+            interface_name: Some(interface_name.clone()),
+            route_type: NetworkRouteType::DirectlyConnected,
+        });
+    }
+    
+    // Pour chaque routeur atteignable, récupérer ses réseaux annoncés
+    let neighbors = state.neighbors.lock().await;
+    for (router_ip, route) in &routes {
+        // Simuler les réseaux annoncés par chaque routeur
+        // Dans un vrai OSPF, ces informations viendraient des LSA
+        let announced_networks = get_networks_announced_by_router(router_ip);
+        
+        for network_cidr in announced_networks {
+            // Ne pas écraser les réseaux directement connectés
+            if !network_paths.contains_key(&network_cidr) {
+                network_paths.insert(network_cidr.clone(), NetworkPathInfo {
+                    network_cidr: network_cidr.clone(),
+                    next_hop: Some(route.next_hop.clone()),
+                    hop_count: route.hop_count,
+                    path: route.path.clone(),
+                    is_reachable: route.is_reachable,
+                    interface_name: None,
+                    route_type: NetworkRouteType::Remote,
+                });
+            }
+        }
+    }
+    drop(neighbors);
+    
+    info!("Calcul terminé : {} réseaux trouvés", network_paths.len());
+    for (network, path_info) in &network_paths {
+        match path_info.route_type {
+            NetworkRouteType::DirectlyConnected => {
+                info!("Réseau {} : directement connecté via {}", 
+                    network, path_info.interface_name.as_ref().unwrap_or(&"?".to_string()));
+            },
+            NetworkRouteType::Remote => {
+                info!("Réseau {} : {} sauts via {} (chemin: {:?})", 
+                    network, path_info.hop_count, 
+                    path_info.next_hop.as_ref().unwrap_or(&"?".to_string()), 
+                    path_info.path);
+            }
+        }
+    }
+    
+    Ok(network_paths)
+}
+
+/// Informations sur le chemin vers un réseau
+#[derive(Debug, Clone)]
+pub struct NetworkPathInfo {
+    pub network_cidr: String,
+    pub next_hop: Option<String>, // None si directement connecté
+    pub hop_count: u32,
+    pub path: Vec<String>,
+    pub is_reachable: bool,
+    pub interface_name: Option<String>, // Pour les réseaux directement connectés
+    pub route_type: NetworkRouteType,
+}
+
+#[derive(Debug, Clone)]
+pub enum NetworkRouteType {
+    DirectlyConnected,
+    Remote,
+}
+
+/// Simule la récupération des réseaux annoncés par un routeur
+/// Dans un vrai OSPF, cela viendrait des LSA Router et Network
+fn get_networks_announced_by_router(router_ip: &str) -> Vec<String> {
+    // Simulation simple - dans la réalité, cela viendrait de la base de données OSPF
+    match router_ip {
+        "192.168.1.1" => vec!["10.1.0.0/24".to_string(), "172.16.1.0/24".to_string()],
+        "192.168.1.2" => vec!["10.2.0.0/24".to_string(), "172.16.2.0/24".to_string()],
+        "192.168.1.3" => vec!["10.3.0.0/24".to_string(), "172.16.3.0/24".to_string()],
+        _ => vec![format!("10.{}.0.0/24", router_ip.split('.').last().unwrap_or("0"))],
+    }
+}
+
+/// Affiche un résumé complet de la topologie et des chemins optimaux
+pub async fn print_network_topology_summary(state: Arc<AppState>) -> Result<()> {
+    println!("\n=== ANALYSE DE LA TOPOLOGIE RÉSEAU ===");
+    
+    // Construire la topologie
+    let topology = build_network_topology(Arc::clone(&state)).await;
+    
+    println!("\n1. ROUTEURS DANS LA TOPOLOGIE :");
+    for (router_id, node) in &topology.nodes {
+        let status = if node.is_reachable { "ACTIF" } else { "INACTIF" };
+        println!("   - {} ({})", router_id, status);
+        for interface in &node.interfaces {
+            let link_status = if interface.is_active { "UP" } else { "DOWN" };
+            println!("     └─ Interface {}: {} [{}]", 
+                interface.name, interface.network, link_status);
+        }
+    }
+    
+    println!("\n2. LIENS RÉSEAU :");
+    let mut displayed_links = HashSet::new();
+    for link in &topology.links {
+        let link_key = if link.from < link.to {
+            format!("{}↔{}", link.from, link.to)
+        } else {
+            format!("{}↔{}", link.to, link.from)
+        };
+        
+        if !displayed_links.contains(&link_key) {
+            displayed_links.insert(link_key);
+            let status = if link.is_active { "ACTIF" } else { "INACTIF" };
+            println!("   - {} ↔ {} [{}] - Coût: {}", 
+                link.from, link.to, status, link.cost);
+        }
+    }
+    
+    println!("\n3. MEILLEURS CHEMINS DEPUIS {} :", state.local_ip);
+    let routes = topology.calculate_shortest_paths(&state.local_ip);
+    
+    if routes.is_empty() {
+        println!("   Aucune route trouvée - Routeur isolé");
+    } else {
+        for (dest, route) in &routes {
+            println!("   Vers {} : {} sauts via {} (chemin: {})", 
+                dest, route.hop_count, route.next_hop, 
+                route.path.join(" → "));
+        }
+    }
+    
+    println!("\n4. RÉSEAUX IP ATTEIGNABLES :");
+    match calculate_best_paths_to_networks(Arc::clone(&state)).await {
+        Ok(network_paths) => {
+            for (network, path_info) in &network_paths {
+                match path_info.route_type {
+                    NetworkRouteType::DirectlyConnected => {
+                        println!("   {} : Directement connecté via {}", 
+                            network, path_info.interface_name.as_ref().unwrap_or(&"?".to_string()));
+                    },
+                    NetworkRouteType::Remote => {
+                        println!("   {} : {} sauts via {} ({})", 
+                            network, path_info.hop_count, 
+                            path_info.next_hop.as_ref().unwrap_or(&"?".to_string()),
+                            path_info.path.join(" → "));
+                    }
+                }
+            }
+        }
+        Err(e) => println!("   Erreur lors du calcul des chemins réseau: {}", e),
+    }
+    
+    println!("\n5. STATISTIQUES :");
+    println!("   - Nombre de routeurs: {}", topology.nodes.len());
+    println!("   - Nombre de liens: {}", topology.links.len() / 2); // Division par 2 car bidirectionnels
+    println!("   - Routeurs atteignables: {}", routes.len());
+    
+    let active_links = topology.links.iter().filter(|l| l.is_active).count() / 2;
+    println!("   - Liens actifs: {}", active_links);
+    
+    println!("\n==========================================\n");
+    
     Ok(())
 }
