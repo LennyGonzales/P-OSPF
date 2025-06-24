@@ -465,62 +465,71 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
     let shortest_paths = topology.calculate_shortest_paths(&state.local_ip);
     info!("Dijkstra calculé: {} destinations trouvées", shortest_paths.len());
     
-    // 3. Pour chaque routeur accessible directement via Dijkstra, voir quels réseaux il peut atteindre
-    let mut routes_to_add = HashMap::new();
+    // 3. Découvrir tous les réseaux annoncés et calculer les meilleures routes vers eux
+    let mut routes_to_add: HashMap<String, RouteInfo> = HashMap::new();
     let local_interfaces = get_local_interface_networks().await;
     let lsa_database = state.lsa_database.lock().await;
     
-    // NOUVELLE APPROCHE: Pour chaque routeur accessible, voir quels réseaux il peut atteindre
-    for (destination_router, route_info) in shortest_paths {
-        // Ignorer nous-mêmes
-        if destination_router == state.local_ip {
-            continue;
-        }
+    // Collecter tous les réseaux annoncés avec leurs routeurs sources
+    let mut network_sources: HashMap<String, Vec<String>> = HashMap::new();
+    
+    for (originator, lsa) in lsa_database.iter() {
+        let clean_originator = extract_ip_from_address(originator);
         
-        // Vérifier si ce routeur annonce des réseaux dans les LSAs
-        if let Some(lsa) = lsa_database.get(&destination_router) {
-            // Pour chaque réseau annoncé par ce routeur
-            for (network_cidr, route_state) in &lsa.routing_table {
-                if matches!(route_state, RouteState::Active(_)) {
-                    // Vérifier que ce n'est pas un réseau local
-                    if is_local_network(network_cidr, &local_interfaces) {
-                        continue;
-                    }
-                    
-                    // Le next-hop est le premier saut dans le chemin vers ce routeur
-                    let next_hop = if route_info.path.len() > 1 {
-                        route_info.path[1].clone()
-                    } else {
-                        destination_router.clone() // Voisin direct
+        // Parcourir les réseaux annoncés par ce routeur
+        for (network_cidr, route_state) in &lsa.routing_table {
+            if matches!(route_state, RouteState::Active(_)) {
+                // Vérifier que ce n'est pas un réseau local
+                if is_local_network(network_cidr, &local_interfaces) {
+                    continue;
+                }
+                
+                network_sources.entry(network_cidr.clone())
+                    .or_insert_with(Vec::new)
+                    .push(clean_originator.clone());
+            }
+        }
+    }
+    
+    // Pour chaque réseau, trouver la meilleure route
+    for (network_cidr, announcing_routers) in network_sources {
+        let mut best_route: Option<RouteInfo> = None;
+        
+        // Tester chaque routeur qui annonce ce réseau
+        for announcing_router in &announcing_routers {
+            if let Some(path_to_announcer) = shortest_paths.get(announcing_router) {
+                // Le next-hop est le premier saut vers le routeur qui annonce ce réseau
+                let next_hop = if path_to_announcer.path.len() > 1 {
+                    path_to_announcer.path[1].clone()
+                } else {
+                    announcing_router.clone() // Voisin direct
+                };
+                
+                if let Ok(target_network) = network_cidr.parse::<pnet::ipnetwork::Ipv4Network>() {
+                    let route = RouteInfo {
+                        destination: network_cidr.clone(),
+                        network: IpNetwork::V4(target_network),
+                        next_hop: next_hop.clone(),
+                        total_cost: path_to_announcer.total_cost,
+                        hop_count: path_to_announcer.hop_count,
+                        bottleneck_capacity: path_to_announcer.bottleneck_capacity,
+                        path: path_to_announcer.path.clone(),
+                        is_reachable: true,
                     };
                     
-                    if let Ok(target_network) = network_cidr.parse::<pnet::ipnetwork::Ipv4Network>() {
-                        let route = RouteInfo {
-                            destination: network_cidr.clone(),
-                            network: IpNetwork::V4(target_network),
-                            next_hop: next_hop.clone(),
-                            total_cost: route_info.total_cost,
-                            hop_count: route_info.hop_count,
-                            bottleneck_capacity: route_info.bottleneck_capacity,
-                            path: route_info.path.clone(),
-                            is_reachable: true,
-                        };
-                        
-                        // Ajouter ou remplacer si c'est une meilleure route
-                        if let Some(existing_route) = routes_to_add.get(network_cidr) {
-                            if route.total_cost < existing_route.total_cost {
-                                routes_to_add.insert(network_cidr.clone(), route);
-                                info!("Meilleure route pour {}: via {} (coût: {})", 
-                                      network_cidr, next_hop, route.total_cost);
-                            }
-                        } else {
-                            routes_to_add.insert(network_cidr.clone(), route);
-                            info!("Nouvelle route pour {}: via {} (coût: {})", 
-                                  network_cidr, next_hop, route.total_cost);
-                        }
+                    // Garder la meilleure route (coût minimum)
+                    if best_route.is_none() || route.total_cost < best_route.as_ref().unwrap().total_cost {
+                        best_route = Some(route);
                     }
                 }
             }
+        }
+        
+        // Ajouter la meilleure route trouvée
+        if let Some(route) = best_route {
+            info!("Meilleure route pour {}: via {} (coût: {}, annoncé par: {:?})", 
+                  network_cidr, route.next_hop, route.total_cost, announcing_routers);
+            routes_to_add.insert(network_cidr, route);
         }
     }
     
