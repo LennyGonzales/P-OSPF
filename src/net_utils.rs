@@ -5,6 +5,8 @@ use std::net::{IpAddr, SocketAddr};
 use pnet::datalink::{self, NetworkInterface};
 use pnet::ipnetwork::IpNetwork;
 use crate::error::{AppError, Result};
+use openssl::symm::{Cipher, Crypter, Mode};
+use openssl::rand::rand_bytes;
 
 pub fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
     let interfaces = datalink::interfaces();
@@ -92,15 +94,18 @@ pub async fn send_message<T: serde::Serialize>(
     socket: &tokio::net::UdpSocket,
     addr: &std::net::SocketAddr,
     message: &T,
+    key: &[u8],
     log_prefix: &str
 ) -> crate::error::Result<()> {
     let serialized = serde_json::to_vec(message)
         .map_err(|e| crate::error::AppError::SerializationError(e))?;
-    
-    socket.send_to(&serialized, addr).await
+
+    let encrypted = encrypt(&serialized, key)?;
+
+    socket.send_to(&encrypted, addr).await
         .map_err(|e| crate::error::AppError::NetworkError(format!("Failed to send message: {}", e)))?;
-    
-    log::info!("{} Message sent to {}", log_prefix, addr);
+
+    log::info!("{} Encrypted message sent to {}", log_prefix, addr);
     Ok(())
 }
 
@@ -118,4 +123,65 @@ pub async fn send_text_response(
     
     log::debug!("[CLI] Sent {} response to {}", log_context, addr);
     Ok(())
+}
+
+/// Chiffre les données en utilisant AES-256-CBC et génère un IV aléatoire.
+///
+/// # Arguments
+/// * `data` - Les données en clair à chiffrer.
+/// * `key` - La clé de 32 octets.
+///
+/// # Returns
+/// * `Result<(Vec<u8>, Vec<u8>)>` - Un tuple contenant l'IV et les données chiffrées.
+pub fn encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Cipher::aes_256_cbc();
+    let mut iv = vec![0u8; cipher.iv_len().unwrap_or(16)];
+    rand_bytes(&mut iv).map_err(|e| AppError::CryptoError(e.to_string()))?;
+
+    let mut crypter = Crypter::new(cipher, Mode::Encrypt, key, Some(&iv))
+        .map_err(|e| AppError::CryptoError(e.to_string()))?;
+
+    let mut ciphertext = vec![0; data.len() + cipher.block_size()];
+    let mut count = crypter.update(data, &mut ciphertext)
+        .map_err(|e| AppError::CryptoError(e.to_string()))?;
+    count += crypter.finalize(&mut ciphertext[count..])
+        .map_err(|e| AppError::CryptoError(e.to_string()))?;
+
+    ciphertext.truncate(count);
+
+    // Préfixer l'IV au ciphertext
+    let mut result = iv;
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+/// Déchiffre les données en utilisant AES-256-CBC.
+///
+/// # Arguments
+/// * `ciphertext` - Les données chiffrées à déchiffrer (IV préfixé).
+/// * `key` - La clé de 32 octets.
+///
+/// # Returns
+/// * `Result<Vec<u8>>` - Les données en clair.
+pub fn decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Cipher::aes_256_cbc();
+    let iv_len = cipher.iv_len().unwrap_or(16);
+
+    if ciphertext.len() < iv_len {
+        return Err(AppError::CryptoError("Ciphertext too short to contain IV".to_string()));
+    }
+
+    let (iv, ciphertext) = ciphertext.split_at(iv_len);
+
+    let mut crypter = Crypter::new(cipher, Mode::Decrypt, key, Some(iv))
+        .map_err(|e| AppError::CryptoError(e.to_string()))?;
+
+    let mut plaintext = vec![0; ciphertext.len() + cipher.block_size()];
+    let mut count = crypter.update(ciphertext, &mut plaintext)
+        .map_err(|e| AppError::CryptoError(e.to_string()))?;
+    count += crypter.finalize(&mut plaintext[count..])
+        .map_err(|e| AppError::CryptoError(e.to_string()))?;
+
+    plaintext.truncate(count);
+    Ok(plaintext)
 }

@@ -10,6 +10,7 @@ pub enum AppError {
     IOError(std::io::Error),
     SerializationError(serde_json::Error),
     RouteError(String),
+    CryptoError(String),
 }
 
 impl fmt::Display for AppError {
@@ -20,6 +21,7 @@ impl fmt::Display for AppError {
             AppError::IOError(err) => write!(f, "IO error: {}", err),
             AppError::SerializationError(err) => write!(f, "Serialization error: {}", err),
             AppError::RouteError(msg) => write!(f, "Route error: {}", msg),
+            AppError::CryptoError(msg) => write!(f, "Crypto error: {}", msg),
         }
     }
 }
