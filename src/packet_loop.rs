@@ -2,7 +2,14 @@
 use log::{info, warn, debug, error};
 
 pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std::sync::Arc<crate::AppState>) -> crate::error::Result<()> {
-    let mut buf = [0; 2048];
+    let mut buf = [0u8; 4096];
+    let (size, src_addr) = socket.recv_from(&mut buf).await?;
+
+    // Déchiffrement du message reçu
+    let decrypted = crate::net_utils::decrypt(&buf[..size], state.key.as_slice())?;
+
+    // Désérialisation du message JSON
+    let json: serde_json::Value = serde_json::from_slice(&decrypted)?;
     let local_ips: std::collections::HashMap<std::net::IpAddr, (String, pnet::ipnetwork::IpNetwork)> = pnet::datalink::interfaces()
         .into_iter()
         .flat_map(|iface| {

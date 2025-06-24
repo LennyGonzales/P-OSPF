@@ -8,5 +8,4 @@ name = "eth1"
 capacity_mbps = 1000    # R_2 and R_5
 link_active = true
 
-[[key]]
 key = "1Jq4357rFRYk/GdtFN0qTlE7Q7BVv7NMcuD2+wDqZD3JWB7/RWALAoY6aVxlyo/K"

@@ -77,22 +77,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     info!("Configuration chargée pour le routeur avec {} interfaces", config.interfaces.len());
     
     let router_ip = get_local_ip()?;
-    info!("Router IP: {}", router_ip);
+    info!("Hostname: {}", hostname::get()?.to_string_lossy());
     let socket = init_socket(PORT).await?;
     let key = config.key
         .as_ref()
         .map(|k| base64::decode(k).unwrap_or_else(|_| k.as_bytes().to_vec()))
         .unwrap_or_else(|| vec![0u8; 32]); // fallback si pas de clé
-    let state = Arc::new(AppState {
-        topology: Mutex::new(HashMap::new()),
-        neighbors: Mutex::new(HashMap::new()),
-        routing_table: Mutex::new(HashMap::new()),
-        processed_lsa: Mutex::new(HashSet::new()),
-        local_ip: router_ip.clone(),
-        enabled: Mutex::new(false),
-        config,
-        key,
-    });
+    let state = init_state(router_ip.clone(), config, key);
     
     // Calculer les routes initiales
     if let Err(e) = dijkstra::calculate_and_update_optimal_routes(Arc::clone(&state)).await {

@@ -5,8 +5,12 @@ use std::net::{IpAddr, SocketAddr};
 use pnet::datalink::{self, NetworkInterface};
 use pnet::ipnetwork::IpNetwork;
 use crate::error::{AppError, Result};
-use openssl::symm::{Cipher, Crypter, Mode};
-use openssl::rand::rand_bytes;
+//use openssl::symm::{Cipher, Crypter, Mode};
+//use openssl::rand::rand_bytes;
+use aes::Aes256;
+use cbc::{Encryptor, Decryptor};
+use cipher::{KeyIvInit, block_padding::Pkcs7, BlockEncryptMut, BlockDecryptMut};
+use rand::{RngCore, rngs::OsRng};
 
 pub fn get_broadcast_addresses(port: u16) -> Vec<(String, SocketAddr)> {
     let interfaces = datalink::interfaces();
@@ -116,26 +120,41 @@ pub async fn send_message<T: serde::Serialize>(
 /// * `key` - La clé de 32 octets.
 ///
 /// # Returns
-/// * `Result<(Vec<u8>, Vec<u8>)>` - Un tuple contenant l'IV et les données chiffrées.
+/// * `Result<Vec<u8>>` - Les données chiffrées avec l'IV préfixé.
 pub fn encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Cipher::aes_256_cbc();
-    let mut iv = vec![0u8; cipher.iv_len().unwrap_or(16)];
-    rand_bytes(&mut iv).map_err(|e| AppError::CryptoError(e.to_string()))?;
+    // Vérifier que la clé fait 32 octets (256 bits)
+    if key.len() != 32 {
+        return Err(AppError::CryptoError("La clé doit faire 32 octets".to_string()));
+    }
+    
+    // Générer un IV aléatoire
+    let mut iv = vec![0u8; 16]; // AES utilise toujours un bloc de 16 octets
+    OsRng.fill_bytes(&mut iv);
+    
+    // Convertir le slice en tableau de taille fixe pour aes/cbc
+    let key_array: &[u8; 32] = key.try_into()
+        .map_err(|_| AppError::CryptoError("Erreur de conversion de clé".to_string()))?;
+    let iv_array: &[u8; 16] = iv.as_slice().try_into()
+        .map_err(|_| AppError::CryptoError("Erreur de conversion d'IV".to_string()))?;
+    
+    // Chiffrer les données
+    let encryptor = Encryptor::<Aes256>::new(key_array.into(), iv_array.into());
+    // Allouer un buffer pour les données + padding maximal possible
+    let block_size = 16;
+    let padding = block_size - (data.len() % block_size);
+    let mut buffer = Vec::with_capacity(data.len() + padding);
+    buffer.extend_from_slice(data);
+    buffer.resize(data.len() + padding, 0u8);
 
-    let mut crypter = Crypter::new(cipher, Mode::Encrypt, key, Some(&iv))
-        .map_err(|e| AppError::CryptoError(e.to_string()))?;
-
-    let mut ciphertext = vec![0; data.len() + cipher.block_size()];
-    let mut count = crypter.update(data, &mut ciphertext)
-        .map_err(|e| AppError::CryptoError(e.to_string()))?;
-    count += crypter.finalize(&mut ciphertext[count..])
-        .map_err(|e| AppError::CryptoError(e.to_string()))?;
-
-    ciphertext.truncate(count);
+    let ciphertext_len = encryptor
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, data.len())
+        .map_err(|e| AppError::CryptoError(format!("Erreur de chiffrement: {}", e)))?
+        .len();
 
     // Préfixer l'IV au ciphertext
     let mut result = iv;
-    result.extend_from_slice(&ciphertext);
+    result.extend_from_slice(&buffer[..ciphertext_len]);
+
     Ok(result)
 }
 
@@ -148,24 +167,34 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 /// # Returns
 /// * `Result<Vec<u8>>` - Les données en clair.
 pub fn decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Cipher::aes_256_cbc();
-    let iv_len = cipher.iv_len().unwrap_or(16);
-
-    if ciphertext.len() < iv_len {
-        return Err(AppError::CryptoError("Ciphertext too short to contain IV".to_string()));
+    // Vérifier que la clé fait 32 octets (256 bits)
+    if key.len() != 32 {
+        return Err(AppError::CryptoError("La clé doit faire 32 octets".to_string()));
     }
-
-    let (iv, ciphertext) = ciphertext.split_at(iv_len);
-
-    let mut crypter = Crypter::new(cipher, Mode::Decrypt, key, Some(iv))
-        .map_err(|e| AppError::CryptoError(e.to_string()))?;
-
-    let mut plaintext = vec![0; ciphertext.len() + cipher.block_size()];
-    let mut count = crypter.update(ciphertext, &mut plaintext)
-        .map_err(|e| AppError::CryptoError(e.to_string()))?;
-    count += crypter.finalize(&mut plaintext[count..])
-        .map_err(|e| AppError::CryptoError(e.to_string()))?;
-
-    plaintext.truncate(count);
-    Ok(plaintext)
+    
+    // Taille IV fixe pour AES
+    let iv_len = 16;
+    
+    // Vérifier que le ciphertext est assez long
+    if ciphertext.len() < iv_len {
+        return Err(AppError::CryptoError("Ciphertext trop court pour contenir l'IV".to_string()));
+    }
+    
+    // Séparer l'IV et le ciphertext
+    let (iv, encrypted_data) = ciphertext.split_at(iv_len);
+    
+    // Convertir le slice en tableau de taille fixe pour aes/cbc
+    let key_array: &[u8; 32] = key.try_into()
+        .map_err(|_| AppError::CryptoError("Erreur de conversion de clé".to_string()))?;
+    let iv_array: &[u8; 16] = iv.try_into()
+        .map_err(|_| AppError::CryptoError("Erreur de conversion d'IV".to_string()))?;
+    
+    // Déchiffrer les données
+    let decryptor = Decryptor::<Aes256>::new(key_array.into(), iv_array.into());
+    let mut buffer = encrypted_data.to_vec();
+    let decrypted = decryptor
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .map_err(|e| AppError::CryptoError(format!("Erreur de déchiffrement: {}", e)))?;
+    
+    Ok(decrypted.to_vec())
 }
