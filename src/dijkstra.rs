@@ -198,7 +198,15 @@ impl NetworkTopology {
         for (dest, hops) in hop_counts {
             if dest != source && hops != u32::MAX {
                 let path = paths.get(&dest).unwrap_or(&Vec::new()).clone();
-                let next_hop = if path.len() > 1 { path[1].clone() } else { dest.clone() };
+                
+                // AMÉLIORATION: Calculer le next-hop correct
+                let next_hop = if path.len() > 1 {
+                    // Utiliser le premier saut dans le chemin (voisin direct)
+                    path[1].clone()
+                } else {
+                    // Si pas de chemin, utiliser la destination (voisin direct)
+                    dest.clone()
+                };
                 
                 // Créer un réseau /32 par défaut pour cette destination
                 let network = match dest.parse::<Ipv4Addr>() {
@@ -447,82 +455,85 @@ pub async fn build_global_network_topology(local_state: Arc<AppState>, all_neigh
 /// Calcule et met à jour les routes optimales en utilisant l'algorithme de Dijkstra
 /// basé sur les LSAs stockées dans la base de données
 pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result<()> {
-    info!("Calcul des routes optimales avec Dijkstra en cours...");
+    info!("Recalcul Dijkstra suite à réception LSA...");
     
-    let mut routes_to_add = HashMap::new();
-    
-    // Obtenir les interfaces locales
-    let local_interfaces = get_local_interface_networks().await;
-    info!("Interfaces locales détectées: {:?}", local_interfaces);
-    
-    // Construire la topologie globale à partir des LSAs
+    // 1. Construire la topologie complète à partir des LSAs
     let topology = build_topology_from_lsas(Arc::clone(&state)).await;
-    info!("Topologie construite: {} nœuds, {} liens", topology.nodes.len(), topology.links.len());
+    info!("Topologie: {} nœuds, {} liens", topology.nodes.len(), topology.links.len());
     
-    // Découvrir tous les réseaux accessibles depuis nos voisins et les LSAs
-    let discoverable_networks = discover_remote_networks(Arc::clone(&state), &local_interfaces).await;
-    info!("Réseaux distants découverts: {:?}", discoverable_networks);
+    // 2. Calculer tous les meilleurs chemins depuis ce routeur
+    let shortest_paths = topology.calculate_shortest_paths(&state.local_ip);
+    info!("Dijkstra calculé: {} destinations trouvées", shortest_paths.len());
     
-    // Pour chaque réseau distant, calculer la meilleure route
-    for (network_cidr, gateway_routers) in discoverable_networks {
-        // Vérifier que ce n'est pas un réseau local
-        if is_local_network(&network_cidr, &local_interfaces) {
-            info!("Réseau {} est local, ignoré", network_cidr);
+    // 3. Pour chaque routeur accessible directement via Dijkstra, voir quels réseaux il peut atteindre
+    let mut routes_to_add = HashMap::new();
+    let local_interfaces = get_local_interface_networks().await;
+    let lsa_database = state.lsa_database.lock().await;
+    
+    // NOUVELLE APPROCHE: Pour chaque routeur accessible, voir quels réseaux il peut atteindre
+    for (destination_router, route_info) in shortest_paths {
+        // Ignorer nous-mêmes
+        if destination_router == state.local_ip {
             continue;
         }
         
-        // Trouver le meilleur routeur pour atteindre ce réseau
-        let mut best_route: Option<RouteInfo> = None;
-        
-        for gateway_router in gateway_routers {
-            // Exécuter Dijkstra vers ce routeur passerelle
-            let shortest_paths = topology.calculate_shortest_paths(&state.local_ip);
-            
-            if let Some(route_to_gateway) = shortest_paths.get(&gateway_router) {
-                if route_to_gateway.is_reachable && route_to_gateway.hop_count > 0 {
-                    // Extraire l'IP pure du next-hop (enlever le masque s'il y en a un)
-                    let clean_next_hop = extract_ip_from_address(&route_to_gateway.next_hop);
+        // Vérifier si ce routeur annonce des réseaux dans les LSAs
+        if let Some(lsa) = lsa_database.get(&destination_router) {
+            // Pour chaque réseau annoncé par ce routeur
+            for (network_cidr, route_state) in &lsa.routing_table {
+                if matches!(route_state, RouteState::Active(_)) {
+                    // Vérifier que ce n'est pas un réseau local
+                    if is_local_network(network_cidr, &local_interfaces) {
+                        continue;
+                    }
                     
-                    // Parser le réseau cible
+                    // Le next-hop est le premier saut dans le chemin vers ce routeur
+                    let next_hop = if route_info.path.len() > 1 {
+                        route_info.path[1].clone()
+                    } else {
+                        destination_router.clone() // Voisin direct
+                    };
+                    
                     if let Ok(target_network) = network_cidr.parse::<pnet::ipnetwork::Ipv4Network>() {
-                        let network_route = RouteInfo {
+                        let route = RouteInfo {
                             destination: network_cidr.clone(),
                             network: IpNetwork::V4(target_network),
-                            next_hop: clean_next_hop,
-                            total_cost: route_to_gateway.total_cost,
-                            hop_count: route_to_gateway.hop_count,
-                            bottleneck_capacity: route_to_gateway.bottleneck_capacity,
-                            path: route_to_gateway.path.clone(),
+                            next_hop: next_hop.clone(),
+                            total_cost: route_info.total_cost,
+                            hop_count: route_info.hop_count,
+                            bottleneck_capacity: route_info.bottleneck_capacity,
+                            path: route_info.path.clone(),
                             is_reachable: true,
                         };
                         
-                        // Choisir la meilleure route (coût le plus faible)
-                        if best_route.is_none() || network_route.total_cost < best_route.as_ref().unwrap().total_cost {
-                            best_route = Some(network_route);
+                        // Ajouter ou remplacer si c'est une meilleure route
+                        if let Some(existing_route) = routes_to_add.get(network_cidr) {
+                            if route.total_cost < existing_route.total_cost {
+                                routes_to_add.insert(network_cidr.clone(), route);
+                                info!("Meilleure route pour {}: via {} (coût: {})", 
+                                      network_cidr, next_hop, route.total_cost);
+                            }
+                        } else {
+                            routes_to_add.insert(network_cidr.clone(), route);
+                            info!("Nouvelle route pour {}: via {} (coût: {})", 
+                                  network_cidr, next_hop, route.total_cost);
                         }
                     }
                 }
             }
         }
-        
-        // Ajouter la meilleure route trouvée
-        if let Some(route) = best_route {
-            info!("Route vers réseau {} via {} (coût: {}, sauts: {})", 
-                  route.destination, route.next_hop, route.total_cost, route.hop_count);
-            routes_to_add.insert(route.destination.clone(), route);
-        }
     }
     
-    info!("Routes à installer: {} routes", routes_to_add.len());
+    drop(lsa_database);
     
-    if routes_to_add.is_empty() {
-        info!("Aucune route à ajouter");
-        return Ok(());
+    // 5. Mettre à jour la table de routage système
+    if !routes_to_add.is_empty() {
+        update_routing_table_safe(Arc::clone(&state), &routes_to_add).await?;
+        info!("Table de routage mise à jour avec {} routes", routes_to_add.len());
+    } else {
+        info!("Aucune nouvelle route à ajouter");
     }
     
-    // Mettre à jour la table de routage système
-    update_routing_table_safe(Arc::clone(&state), &routes_to_add).await?;
-    info!("Table de routage mise à jour avec {} routes Dijkstra", routes_to_add.len());
     Ok(())
 }
 
@@ -549,30 +560,36 @@ async fn build_topology_from_lsas(state: Arc<AppState>) -> NetworkTopology {
     let neighbors = state.neighbors.lock().await;
     
     for (originator, lsa) in lsa_database.iter() {
+        // Nettoyer l'ID du routeur originator (enlever /24 s'il y en a un)
+        let clean_originator = extract_ip_from_address(originator);
+        
         // Ajouter le routeur originator s'il n'existe pas
-        if !topology.nodes.contains_key(originator) {
-            topology.add_router(originator.clone(), Vec::new());
-            info!("Ajouté routeur depuis LSA: {}", originator);
+        if !topology.nodes.contains_key(&clean_originator) {
+            topology.add_router(clean_originator.clone(), Vec::new());
+            info!("Ajouté routeur depuis LSA: {}", clean_originator);
         }
         
         // Ajouter des liens basés sur les voisins annoncés dans la LSA
         for neighbor in &lsa.neighbors {
             if neighbor.link_up {
+                // Nettoyer l'ID du routeur voisin (enlever /24 s'il y en a un)
+                let clean_neighbor_ip = extract_ip_from_address(&neighbor.neighbor_ip);
+                
                 // Ajouter le routeur voisin s'il n'existe pas
-                if !topology.nodes.contains_key(&neighbor.neighbor_ip) {
-                    topology.add_router(neighbor.neighbor_ip.clone(), Vec::new());
-                    info!("Ajouté routeur voisin depuis LSA: {}", neighbor.neighbor_ip);
+                if !topology.nodes.contains_key(&clean_neighbor_ip) {
+                    topology.add_router(clean_neighbor_ip.clone(), Vec::new());
+                    info!("Ajouté routeur voisin depuis LSA: {}", clean_neighbor_ip);
                 }
                 
                 // Ajouter le lien bidirectionnel
                 topology.add_link(
-                    originator.clone(),
-                    neighbor.neighbor_ip.clone(),
+                    clean_originator.clone(),
+                    clean_neighbor_ip.clone(),
                     neighbor.capacity,
                     neighbor.link_up,
                 );
                 info!("Ajouté lien: {} <-> {} (capacité: {} Mbps)", 
-                      originator, neighbor.neighbor_ip, neighbor.capacity);
+                      clean_originator, clean_neighbor_ip, neighbor.capacity);
             }
         }
     }
@@ -580,21 +597,35 @@ async fn build_topology_from_lsas(state: Arc<AppState>) -> NetworkTopology {
     // Ajouter nos propres voisins directs
     for (neighbor_ip, neighbor) in neighbors.iter() {
         if neighbor.link_up {
+            // Nettoyer l'ID du voisin (enlever /24 s'il y en a un)
+            let clean_neighbor_ip = extract_ip_from_address(neighbor_ip);
+            
             // Ajouter le voisin s'il n'existe pas
-            if !topology.nodes.contains_key(neighbor_ip) {
-                topology.add_router(neighbor_ip.clone(), Vec::new());
-                info!("Ajouté notre voisin direct: {}", neighbor_ip);
+            if !topology.nodes.contains_key(&clean_neighbor_ip) {
+                topology.add_router(clean_neighbor_ip.clone(), Vec::new());
+                info!("Ajouté notre voisin direct: {}", clean_neighbor_ip);
             }
             
-            // Ajouter le lien bidirectionnel avec notre routeur
-            topology.add_link(
-                state.local_ip.clone(),
-                neighbor_ip.clone(),
-                neighbor.capacity,
-                neighbor.link_up,
-            );
-            info!("Ajouté notre lien direct: {} <-> {} (capacité: {} Mbps)", 
-                  state.local_ip, neighbor_ip, neighbor.capacity);
+            // AMÉLIORATION: S'assurer que nous n'ajoutons que des liens vers des voisins réellement accessibles
+            // Vérifier que le voisin n'est pas déjà connecté
+            let already_connected = topology.links.iter().any(|link| {
+                (link.from == state.local_ip && link.to == clean_neighbor_ip) ||
+                (link.from == clean_neighbor_ip && link.to == state.local_ip)
+            });
+            
+            if !already_connected {
+                // Ajouter le lien bidirectionnel avec notre routeur
+                topology.add_link(
+                    state.local_ip.clone(),
+                    clean_neighbor_ip.clone(),
+                    neighbor.capacity,
+                    neighbor.link_up,
+                );
+                info!("Ajouté notre lien direct: {} <-> {} (capacité: {} Mbps)", 
+                      state.local_ip, clean_neighbor_ip, neighbor.capacity);
+            } else {
+                info!("Lien déjà existant: {} <-> {}", state.local_ip, clean_neighbor_ip);
+            }
         }
     }
     
@@ -609,10 +640,6 @@ async fn build_topology_from_lsas(state: Arc<AppState>) -> NetworkTopology {
 pub async fn update_routing_table_safe(state: Arc<AppState>, routes: &HashMap<String, RouteInfo>) -> Result<()> {
     let mut routing_table = state.routing_table.lock().await;
     
-    // NE PAS nettoyer toutes les routes - seulement les routes OSPF spécifiques
-    // Les routes locales (scope link) ne doivent pas être touchées
-    
-    // Vider seulement la table de routage en mémoire (pas le système)
     routing_table.clear();
     
     // Mise à jour de la table de routage en mémoire
@@ -712,36 +739,6 @@ async fn remove_system_route(destination: &str, network: IpNetwork) -> Result<()
     Ok(())
 }
 
-/// Nettoie toutes les routes OSPF de la table de routage système
-async fn cleanup_system_routes(old_routes: &HashMap<String, (String, RouteState, IpNetwork)>, local_interfaces: &HashMap<String, IpNetwork>) -> Result<()> {
-    info!("Nettoyage des anciennes routes OSPF (garder les routes locales)");
-    
-    for (destination, (gateway, _, network)) in old_routes {
-        // Ne supprimer que les routes OSPF (via gateway), pas les routes locales
-        if !gateway.is_empty() {
-            // Vérifier que ce n'est pas une route vers un réseau local
-            let mut is_local_network = false;
-            if let Ok(dest_network) = destination.parse::<pnet::ipnetwork::Ipv4Network>() {
-                for (_, local_net) in local_interfaces {
-                    if let IpNetwork::V4(local_net_v4) = local_net {
-                        if dest_network.network() == local_net_v4.network() {
-                            is_local_network = true;
-                            info!("Garde la route vers {} car c'est un réseau local", destination);
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            if !is_local_network {
-                info!("Suppression de l'ancienne route OSPF: {} via {}", destination, gateway);
-                let _ = remove_system_route(destination, *network).await; // Ignore les erreurs
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Récupère les réseaux des interfaces locales du système
 async fn get_local_interface_networks() -> HashMap<String, IpNetwork> {
     let mut networks = HashMap::new();
@@ -768,73 +765,16 @@ async fn get_local_interface_networks() -> HashMap<String, IpNetwork> {
     networks
 }
 
-/// Découvre tous les réseaux distants accessibles via nos voisins et les LSAs
-async fn discover_remote_networks(state: Arc<AppState>, local_interfaces: &HashMap<String, IpNetwork>) -> HashMap<String, Vec<String>> {
-    let mut networks = HashMap::new();
-    
-    // Examiner tous les voisins directs pour découvrir leurs réseaux
-    let neighbors = state.neighbors.lock().await;
-    for (neighbor_ip, neighbor) in neighbors.iter() {
-        if neighbor.link_up {
-            // Déduire le réseau du voisin à partir de son IP
-            if let Ok(neighbor_addr) = neighbor_ip.parse::<Ipv4Addr>() {
-                // Supposer un masque /24 pour simplifier
-                let network_cidr = format!("{}.0/24", 
-                    format!("{}.{}.{}", neighbor_addr.octets()[0], neighbor_addr.octets()[1], neighbor_addr.octets()[2]));
-                
-                // Ajouter ce réseau avec le voisin comme passerelle
-                networks.entry(network_cidr)
-                    .or_insert_with(Vec::new)
-                    .push(neighbor_ip.clone());
-            }
-        }
+/// Normalise une adresse IP/CIDR en adresse réseau
+/// Convertit par exemple 192.168.2.1/24 en 192.168.2.0/24
+fn normalize_to_network_address(cidr: &str) -> String {
+    if let Ok(network) = cidr.parse::<pnet::ipnetwork::Ipv4Network>() {
+        // Utiliser l'adresse réseau réelle, pas l'adresse d'hôte
+        format!("{}/{}", network.network(), network.prefix())
+    } else {
+        // En cas d'erreur de parsing, retourner l'original
+        cidr.to_string()
     }
-    
-    // Examiner les LSAs pour découvrir d'autres réseaux
-    let lsa_database = state.lsa_database.lock().await;
-    for (originator, lsa) in lsa_database.iter() {
-        info!("Processing LSA from router: {}", originator);
-        
-        // NOUVEAU: Parcourir la routing_table de cette LSA pour découvrir tous les réseaux annoncés
-        for (network_cidr, route_state) in &lsa.routing_table {
-            // Ne considérer que les routes actives
-            if matches!(route_state, RouteState::Active(_)) {
-                info!("Discovered remote network: {} from LSA router: {}", network_cidr, originator);
-                // Ajouter ce réseau avec l'originator comme routeur qui l'annonce
-                networks.entry(network_cidr.clone())
-                    .or_insert_with(Vec::new)
-                    .push(originator.clone());
-            }
-        }
-        
-        // Aussi parcourir les voisins pour déduire leurs réseaux potentiels (comme avant)
-        for neighbor_info in &lsa.neighbors {
-            if neighbor_info.link_up {
-                if let Ok(neighbor_addr) = neighbor_info.neighbor_ip.parse::<Ipv4Addr>() {
-                    let network_cidr = format!("{}.0/24", 
-                        format!("{}.{}.{}", neighbor_addr.octets()[0], neighbor_addr.octets()[1], neighbor_addr.octets()[2]));
-                    
-                    // Ajouter ce réseau avec l'originator comme passerelle possible
-                    networks.entry(network_cidr)
-                        .or_insert_with(Vec::new)
-                        .push(originator.clone());
-                }
-            }
-        }
-    }
-    
-    drop(neighbors);
-    drop(lsa_database);
-    
-    // Filtrer les réseaux locaux
-    networks.retain(|network_cidr, _| !is_local_network(network_cidr, local_interfaces));
-    
-    info!("Réseaux distants découverts: {:?}", networks);
-    for (network, routers) in &networks {
-        info!("Network: {} announced by routers: {:?}", network, routers);
-    }
-    
-    networks
 }
 
 /// Vérifie si un réseau est local (directement connecté)
@@ -851,12 +791,61 @@ fn is_local_network(network_cidr: &str, local_interfaces: &HashMap<String, IpNet
     false
 }
 
-/// Extrait l'adresse IP pure d'une chaîne qui peut contenir un masque
+/// Extrait l'adresse IP d'une chaîne qui peut contenir un suffixe CIDR
+/// Par exemple: "10.1.0.2/24" -> "10.1.0.2"
 fn extract_ip_from_address(address: &str) -> String {
-    // Si l'adresse contient un '/', prendre seulement la partie avant
-    if let Some(slash_pos) = address.find('/') {
-        address[..slash_pos].to_string()
+    if let Some(pos) = address.find('/') {
+        address[..pos].to_string()
     } else {
         address.to_string()
     }
+}
+
+// Fonction supprimée - logique simplifiée dans calculate_and_update_optimal_routes
+
+/// Découvre tous les réseaux distants à partir des LSAs (version simplifiée)
+async fn discover_all_networks_from_lsas(state: Arc<AppState>) -> HashMap<String, Vec<String>> {
+    let mut networks = HashMap::new();
+    
+    let lsa_database = state.lsa_database.lock().await;
+    
+    // Parcourir toutes les LSAs pour extraire les réseaux annoncés
+    for (originator, lsa) in lsa_database.iter() {
+        let clean_originator = extract_ip_from_address(originator);
+        
+        // 1. Extraire les réseaux de la routing_table du LSA
+        for (network_cidr, route_state) in &lsa.routing_table {
+            // Ne considérer que les routes actives
+            if matches!(route_state, RouteState::Active(_)) {
+                networks.entry(network_cidr.clone())
+                    .or_insert_with(Vec::new)
+                    .push(clean_originator.clone());
+                    
+                info!("Réseau {} annoncé par {}", network_cidr, clean_originator);
+            }
+        }
+        
+        // 2. Inférer les réseaux à partir des IPs des voisins
+        for neighbor_info in &lsa.neighbors {
+            if neighbor_info.link_up {
+                if let Ok(neighbor_addr) = neighbor_info.neighbor_ip.parse::<Ipv4Addr>() {
+                    // Générer le réseau /24 basé sur l'IP du voisin
+                    let network_cidr = format!("{}.{}.{}.0/24",
+                        neighbor_addr.octets()[0], 
+                        neighbor_addr.octets()[1], 
+                        neighbor_addr.octets()[2]);
+                    
+                    networks.entry(network_cidr.clone())
+                        .or_insert_with(Vec::new)
+                        .push(clean_originator.clone());
+                        
+                    info!("Réseau {} inféré depuis voisin {} de {}", 
+                          network_cidr, neighbor_info.neighbor_ip, clean_originator);
+                }
+            }
+        }
+    }
+    
+    drop(lsa_database);
+    networks
 }
