@@ -8,13 +8,28 @@ use crate::error::{AppError, Result};
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct InterfaceConfig {
     pub name: String,
-    pub capacity_mbps: u32,
+    #[serde(default = "default_capacity")]
+    pub capacity: u32,
     #[serde(default = "default_link_active")]
     pub link_active: bool,
+    #[serde(default)]
+    pub ip: String,
+    #[serde(default = "default_mask")]
+    pub mask: u8,
+    #[serde(default)]
+    pub network: String,
+}
+
+fn default_capacity() -> u32 {
+    100 // 100 Mbps par défaut
 }
 
 fn default_link_active() -> bool {
     true
+}
+
+fn default_mask() -> u8 {
+    24 // /24 par défaut
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
