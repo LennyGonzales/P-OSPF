@@ -23,6 +23,7 @@ cbc = "0.1"
 rand = "0.8"
 base64 = "0.22.1"
 cipher = "0.4.4"
+rtnetlink = "0.13"
 
 [[bin]]
 name = "routing"

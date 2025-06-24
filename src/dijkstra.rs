@@ -290,40 +290,82 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
     // Construire la topologie
     let topology = build_network_topology(Arc::clone(&state)).await;
     
-    // Calculer les meilleurs chemins
-    let routes = topology.calculate_shortest_paths(&state.local_ip);
+    // Calculer les meilleurs chemins vers chaque routeur
+    let shortest_paths = topology.calculate_shortest_paths(&state.local_ip);
     
-    if routes.is_empty() {
+    if shortest_paths.is_empty() {
         debug!("Aucune route calculée - routeur probablement isolé");
         return Ok(());
     }
     
-    // Mettre à jour la table de routage locale
-    let mut routing_table = state.routing_table.lock().await;
-    routing_table.clear();
-    
-    for (destination, route) in &routes {
-        routing_table.insert(
-            destination.clone(),
-            (route.next_hop.clone(), RouteState::Active(route.total_cost)),
-        );
-    }
-    drop(routing_table);
-    
-    // Mettre à jour la table de routage système (optionnel)
-    for (destination, route) in &routes {
-        if let Err(e) = update_system_route(destination, &route.next_hop).await {
-            warn!("Échec de la mise à jour de la route système vers {}: {}", destination, e);
+    let mut new_routing_table = HashMap::new();
+    let lsdb = state.topology.lock().await;
+
+    // Parcourir la LSDB pour trouver les réseaux annoncés
+    for (originator, router_state) in lsdb.iter() {
+        if let Some(lsa) = &router_state.last_lsa {
+            // Trouver le chemin vers cet originator
+            if let Some(route_info) = shortest_paths.get(originator) {
+                // Parcourir les routes annoncées par cet originator
+                for (network_prefix, route_state) in &lsa.routing_table {
+                    if let RouteState::Active(_) = route_state {
+                        // Ajouter la route à notre table de routage interne
+                        new_routing_table.insert(
+                            network_prefix.clone(),
+                            (route_info.next_hop.clone(), route_state.clone()),
+                        );
+                        // Mettre à jour la table de routage système
+                        if let Err(e) = crate::lsa::update_routing_table_safe(network_prefix, &route_info.next_hop).await {
+                            warn!("Échec de la mise à jour de la route système vers {} via {}: {}", network_prefix, &route_info.next_hop, e);
+                        }
+                    }
+                }
+            }
         }
     }
+
+    // Mise à jour complète de la table de routage
+    let mut routing_table = state.routing_table.lock().await;
+    *routing_table = new_routing_table;
     
-    debug!("Calcul des routes terminé. {} routes optimales calculées.", routes.len());
+    debug!("Calcul des routes terminé. {} routes dans la table.", routing_table.len());
     Ok(())
 }
 
-/// Met à jour une route dans la table de routage système
+/// Met à jour une route dans la table de routage système en utilisant la bibliothèque rtnetlink (pour Linux, IPv4 uniquement)
 async fn update_system_route(destination: &str, gateway: &str) -> Result<()> {
-    // Implémentation simplifiée - dans un vrai système, utiliser netlink ou ip route
-    debug!("Route système: {} via {}", destination, gateway);
-    Ok(())
+    use rtnetlink::{new_connection, IpVersion};
+    use std::net::Ipv4Addr;
+    use tokio::time::{timeout, Duration};
+
+    // Parse destination et gateway en IPv4
+    let dest_ip: Ipv4Addr = destination.parse().map_err(|e| AppError::RouteError(format!("Destination IPv4 invalide: {}", e)))?;
+    let gw_ip: Ipv4Addr = gateway.parse().map_err(|e| AppError::RouteError(format!("Gateway IPv4 invalide: {}", e)))?;
+
+    // Crée une connexion netlink
+    let (connection, handle, _) = new_connection().map_err(|e| AppError::RouteError(format!("Erreur netlink: {}", e)))?;
+    tokio::spawn(connection);
+
+    // Ajoute ou remplace la route (prefix /32 pour une IP unique)
+    let fut = handle.route().add()
+        .v4()
+        .destination_prefix(dest_ip, 32)
+        .gateway(gw_ip)
+        .execute();
+
+    // Timeout pour éviter de bloquer indéfiniment
+    match timeout(Duration::from_secs(2), fut).await {
+        Ok(Ok(_)) => {
+            debug!("Route système mise à jour: {} via {}", destination, gateway);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            warn!("Erreur netlink lors de la mise à jour de la route: {}", e);
+            Err(AppError::RouteError(format!("Erreur netlink: {}", e)))
+        }
+        Err(_) => {
+            warn!("Timeout netlink lors de la mise à jour de la route");
+            Err(AppError::RouteError("Timeout netlink".into()))
+        }
+    }
 }

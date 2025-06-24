@@ -9,15 +9,16 @@ use crate::types::{LSAMessage, RouteState};
 use crate::error::{AppError, Result};
 
 pub async fn update_topology(state: Arc<crate::AppState>, lsa: &crate::types::LSAMessage) -> Result<()> {
-    let _current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| AppError::ConfigError(e.to_string()))?
-        .as_secs();
     let mut topology = state.topology.lock().await;
-    topology.insert(
-        lsa.originator.clone(),
-        crate::types::Router {},
-    );
+
+    let router_state = topology.entry(lsa.originator.clone()).or_insert_with(crate::types::Router::new);
+
+    // Ne mettre à jour que si le nouveau LSA est plus récent
+    if router_state.last_lsa.as_ref().map_or(true, |old_lsa| lsa.seq_num > old_lsa.seq_num) {
+        router_state.last_lsa = Some(lsa.clone());
+        debug!("Updated topology for originator {}", lsa.originator);
+    }
+    
     Ok(())
 }
 
@@ -156,101 +157,11 @@ pub async fn forward_lsa(
 pub async fn update_routing_from_lsa(
     state: std::sync::Arc<crate::AppState>,
     lsa: &crate::types::LSAMessage,
-    sender_ip: &str,
-    socket: &tokio::net::UdpSocket
+    _sender_ip: &str,
+    _socket: &tokio::net::UdpSocket
 ) -> Result<()> {
-    let mut routing_table = state.routing_table.lock().await;
-    let next_hop = sender_ip.to_string();
-    if lsa.originator != state.local_ip {
-        let existing_entry = routing_table.get(&lsa.originator);
-        let should_update = match existing_entry {
-            Some((_, crate::types::RouteState::Active(current_metric))) => {
-                match lsa.routing_table.get(&lsa.originator) {
-                    Some(crate::types::RouteState::Active(new_metric)) => new_metric < current_metric,
-                    _ => false,
-                }
-            },
-            Some((_, crate::types::RouteState::Unreachable)) => true,
-            None => true,
-        };
-        if should_update {
-            let metric = match lsa.routing_table.get(&lsa.originator) {
-                Some(crate::types::RouteState::Active(m)) => *m + 1,
-                _ => 1,
-            };
-            routing_table.insert(lsa.originator.clone(), (next_hop.clone(), crate::types::RouteState::Active(metric)));
-            info!("Updated route: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
-            if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
-                warn!("Could not update system routing table for {}: {}", lsa.originator, e);
-            }
-        }
-    }
-    // Traiter les routes depuis la table de routage de la LSA (réseaux uniquement)
-    for (dest, route_state) in &lsa.routing_table {
-        // Ignorer les routes vers soi-même
-        if dest == &state.local_ip {
-            continue;
-        }
-        
-        // Ignorer les routes vers des IPs individuelles (ne traiter que les réseaux CIDR)
-        if !dest.contains('/') {
-            debug!("Skipping individual IP route: {}", dest);
-            continue;
-        }
-        
-        // Vérifier si c'est un réseau valide (pas une route vers une IP du même réseau local)
-        if let Ok(dest_network) = dest.parse::<pnet::ipnetwork::IpNetwork>() {
-            if let pnet::ipnetwork::IpNetwork::V4(dest_net) = dest_network {
-                // Vérifier si ce réseau est déjà directement connecté (éviter les doublons)
-                let interfaces = pnet::datalink::interfaces();
-                let mut is_local = false;
-                for iface in interfaces {
-                    for ip_network in iface.ips {
-                        if let pnet::ipnetwork::IpNetwork::V4(local_net) = ip_network {
-                            if dest_net.network() == local_net.network() && dest_net.prefix() == local_net.prefix() {
-                                is_local = true;
-                                break;
-                            }
-                        }
-                    }
-                    if is_local { break; }
-                }
-                
-                if is_local {
-                    debug!("Skipping route to local network: {}", dest);
-                    continue;
-                }
-            }
-        }
-        
-        match route_state {
-            crate::types::RouteState::Active(metric) => {
-                let existing_entry = routing_table.get(dest);
-                let new_metric = metric + 1;
-                let should_update = match existing_entry {
-                    Some((_, crate::types::RouteState::Active(current_metric))) => new_metric < *current_metric,
-                    Some((_, crate::types::RouteState::Unreachable)) => true,
-                    None => true,
-                };
-                if should_update {
-                    routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                    info!("Learned network route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
-                    if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
-                        warn!("Could not update system routing table for {}: {}", dest, e);
-                    }
-                }
-            },
-            crate::types::RouteState::Unreachable => {
-                if let Some((current_next_hop, _)) = routing_table.get(dest) {
-                    if current_next_hop == &next_hop {
-                        routing_table.insert(dest.clone(), (next_hop.clone(), crate::types::RouteState::Unreachable));
-                        info!("Network route marked as unreachable: {}", dest);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    // Appeler le recalcul global des routes à chaque réception de LSA
+    crate::dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await
 }
 
 pub async fn send_poisoned_route(
