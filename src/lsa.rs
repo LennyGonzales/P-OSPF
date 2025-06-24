@@ -94,31 +94,62 @@ pub async fn send_lsa(
 
 pub async fn forward_lsa(
     socket: &tokio::net::UdpSocket,
-    addr: &std::net::SocketAddr,
-    router_ip: &str,
+    _broadcast_addr: &std::net::SocketAddr, // ignoré, on envoie unicast à chaque voisin
+    local_ip: &str,
     original_lsa: &crate::types::LSAMessage,
-    path: Vec<String>,
-    state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
+    mut path: Vec<String>,
+    state: &std::sync::Arc<crate::AppState>,
 ) -> Result<()> {
     if original_lsa.ttl <= 1 {
         return Ok(());
     }
-    let message = crate::types::LSAMessage {
-        message_type: 2,
-        router_ip: router_ip.to_string(),
-        last_hop: Some(router_ip.to_string()),
-        originator: original_lsa.originator.clone(),
-        seq_num: original_lsa.seq_num,
-        neighbor_count: original_lsa.neighbor_count,
-        neighbors: original_lsa.neighbors.clone(),
-        routing_table: original_lsa.routing_table.clone(),
-        path,
-        ttl: original_lsa.ttl - 1,
-    };
-    
-    crate::net_utils::send_message(socket, addr, &message, state.key.as_slice(), "[FORWARD]").await?;
-    info!("[FORWARD] LSA from {} (originator: {}, seq: {}) to {}", 
-          router_ip, original_lsa.originator, original_lsa.seq_num, addr);
+
+    // Ajoute notre IP au chemin
+    if !path.contains(&local_ip.to_string()) {
+        path.push(local_ip.to_string());
+    }
+
+    let neighbors = state.neighbors.lock().await;
+    for (neighbor_ip, neighbor) in neighbors.iter() {
+        // Ne pas relayer à soi-même, ni à l'expéditeur direct (last_hop)
+        if neighbor_ip == local_ip {
+            continue;
+        }
+        if let Some(last_hop) = &original_lsa.last_hop {
+            if neighbor_ip == last_hop {
+                continue;
+            }
+        }
+        if !neighbor.link_up {
+            continue;
+        }
+        // Empêcher la boucle : ne pas relayer si déjà dans le path
+        if path.contains(neighbor_ip) {
+            continue;
+        }
+        // Calculer l'adresse du voisin
+        let addr = format!("{}:{}", neighbor_ip, crate::PORT)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| AppError::NetworkError(format!("Invalid neighbor addr: {}", e)))?;
+
+        // Préparer le LSA à relayer
+        let message = crate::types::LSAMessage {
+            message_type: 2,
+            router_ip: local_ip.to_string(),
+            last_hop: Some(local_ip.to_string()),
+            originator: original_lsa.originator.clone(),
+            seq_num: original_lsa.seq_num,
+            neighbor_count: original_lsa.neighbor_count,
+            neighbors: original_lsa.neighbors.clone(),
+            routing_table: original_lsa.routing_table.clone(),
+            path: path.clone(),
+            ttl: original_lsa.ttl - 1,
+        };
+
+        crate::net_utils::send_message(socket, &addr, &message, state.key.as_slice(), "[FORWARD]").await?;
+        info!("[FORWARD] LSA from {} (originator: {}, seq: {}) to {}", 
+              local_ip, original_lsa.originator, original_lsa.seq_num, addr);
+    }
     Ok(())
 }
 
