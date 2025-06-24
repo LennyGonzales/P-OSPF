@@ -87,9 +87,14 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                     if lsa.originator != receiving_interface_ip {
                                         let path_contains_us = lsa.path.contains(&receiving_interface_ip);
                                         if !path_contains_us {
-                                            if let Err(e) = crate::lsa::update_routing_from_lsa(std::sync::Arc::clone(&state), &lsa, 
-                                                                                  &src_addr.ip().to_string(), &socket).await {
-                                                log::error!("Failed to update routing from LSA: {}", e);
+                                            // Stocker la LSA dans la base de données
+                                            {
+                                                let mut lsa_db = state.lsa_database.lock().await;
+                                                lsa_db.insert(lsa.originator.clone(), lsa.clone());
+                                            }
+                                            
+                                            if let Err(e) = crate::dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await {
+                                                log::error!("Failed to trigger Dijkstra calculation: {}", e);
                                             }
                                             if let Err(e) = crate::lsa::update_topology(std::sync::Arc::clone(&state), &lsa).await {
                                                 log::error!("Failed to update topology: {}", e);

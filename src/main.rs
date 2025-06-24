@@ -37,6 +37,7 @@ pub struct AppState {
     pub neighbors: Mutex<HashMap<String, Neighbor>>,
     pub routing_table: Mutex<HashMap<String, (String, RouteState)>>,
     pub processed_lsa: Mutex<HashSet<(String, u32)>>,
+    pub lsa_database: Mutex<HashMap<String, LSAMessage>>, // Base de données LSA pour Dijkstra
     pub local_ip: String,
     pub enabled: Mutex<bool>, // État d'activation du protocole OSPF
     pub config: read_config::RouterConfig, // Configuration du routeur
