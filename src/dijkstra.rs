@@ -283,47 +283,68 @@ pub async fn build_network_topology(state: Arc<AppState>) -> NetworkTopology {
     topology
 }
 
+/// Construit la topologie réseau globale à partir de toutes les informations de voisinage (LSAs)
+pub async fn build_global_network_topology(local_state: Arc<AppState>, all_neighbors: Vec<(String, Vec<Neighbor>)>) -> NetworkTopology {
+    let mut topology = NetworkTopology::new();
+    // Ajouter tous les routeurs et leurs interfaces
+    for (router_ip, neighbors) in &all_neighbors {
+        if !topology.nodes.contains_key(router_ip) {
+            topology.add_router(router_ip.clone(), Vec::new());
+        }
+        for neighbor in neighbors {
+            if !topology.nodes.contains_key(&neighbor.neighbor_ip) {
+                topology.add_router(neighbor.neighbor_ip.clone(), Vec::new());
+            }
+            if neighbor.link_up {
+                topology.add_link(
+                    router_ip.clone(),
+                    neighbor.neighbor_ip.clone(),
+                    neighbor.capacity,
+                    true,
+                );
+            }
+        }
+    }
+    // Ajouter le routeur local et ses interfaces réelles
+    let local_interfaces = local_state.config.interfaces.iter().map(|iface| {
+        InterfaceInfo {
+            name: iface.name.clone(),
+            network: format!("network_{}", iface.name),
+            capacity_mbps: iface.capacity_mbps,
+            is_active: iface.link_active,
+            connected_to: None,
+        }
+    }).collect();
+    topology.add_router(local_state.local_ip.clone(), local_interfaces);
+    topology
+}
+
 /// Calcule et met à jour les routes optimales
 pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result<()> {
     debug!("Calcul des routes optimales en cours...");
-    
     // Construire la topologie
     let topology = build_network_topology(Arc::clone(&state)).await;
-    
     // Calculer les meilleurs chemins
     let routes = topology.calculate_shortest_paths(&state.local_ip);
-    
     if routes.is_empty() {
         debug!("Aucune route calculée - routeur probablement isolé");
         return Ok(());
     }
-    
-    // Mettre à jour la table de routage locale
+    // Utiliser la fonction sécurisée pour mettre à jour la table de routage
+    update_routing_table_safe(Arc::clone(&state), &routes).await?;
+    debug!("Calcul des routes terminé. {} routes optimales calculées.", routes.len());
+    Ok(())
+}
+
+/// Met à jour la table de routage locale de façon sécurisée
+pub async fn update_routing_table_safe(state: Arc<AppState>, routes: &HashMap<String, RouteInfo>) -> Result<()> {
     let mut routing_table = state.routing_table.lock().await;
     routing_table.clear();
-    
-    for (destination, route) in &routes {
+    for (destination, route) in routes {
         routing_table.insert(
             destination.clone(),
             (route.next_hop.clone(), RouteState::Active(route.total_cost)),
         );
     }
-    drop(routing_table);
-    
-    // Mettre à jour la table de routage système (optionnel)
-    for (destination, route) in &routes {
-        if let Err(e) = update_system_route(destination, &route.next_hop).await {
-            warn!("Échec de la mise à jour de la route système vers {}: {}", destination, e);
-        }
-    }
-    
-    debug!("Calcul des routes terminé. {} routes optimales calculées.", routes.len());
-    Ok(())
-}
-
-/// Met à jour une route dans la table de routage système
-async fn update_system_route(destination: &str, gateway: &str) -> Result<()> {
-    // Implémentation simplifiée - dans un vrai système, utiliser netlink ou ip route
-    debug!("Route système: {} via {}", destination, gateway);
     Ok(())
 }
