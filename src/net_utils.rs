@@ -5,8 +5,6 @@ use std::net::{IpAddr, SocketAddr};
 use pnet::datalink::{self, NetworkInterface};
 use pnet::ipnetwork::IpNetwork;
 use crate::error::{AppError, Result};
-//use openssl::symm::{Cipher, Crypter, Mode};
-//use openssl::rand::rand_bytes;
 use aes::Aes256;
 use cbc::{Encryptor, Decryptor};
 use cipher::{KeyIvInit, block_padding::Pkcs7, BlockEncryptMut, BlockDecryptMut};

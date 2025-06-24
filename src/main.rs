@@ -1,5 +1,5 @@
 mod types;
-mod error;
+pub mod error;
 pub mod net_utils;
 mod neighbor;
 mod lsa;
