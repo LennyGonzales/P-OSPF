@@ -1,6 +1,6 @@
 mod types;
 mod error;
-mod net_utils;
+pub mod net_utils;
 mod neighbor;
 mod lsa;
 mod init;

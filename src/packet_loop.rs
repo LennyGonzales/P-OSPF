@@ -6,7 +6,13 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
     let (size, src_addr) = socket.recv_from(&mut buf).await?;
 
     // Déchiffrement du message reçu
-    let decrypted = crate::net_utils::decrypt(&buf[..size], state.key.as_slice())?;
+    let decrypted = match crate::net_utils::decrypt(&buf[..size], state.key.as_slice()) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("Failed to decrypt message: {}", e);
+            return Err(e);
+        }
+    };
 
     // Désérialisation du message JSON
     let json: serde_json::Value = serde_json::from_slice(&decrypted)?;
@@ -32,6 +38,16 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
             continue;
         }
         log::debug!("Received {} bytes from {}", len, src_addr);
+        
+        // Déchiffrer le message avant de le traiter
+        let decrypted = match crate::net_utils::decrypt(&buf[..len], state.key.as_slice()) {
+            Ok(data) => data,
+            Err(e) => {
+                log::error!("Failed to decrypt message: {}", e);
+                continue;
+            }
+        };
+        
         let (receiving_interface_ip, receiving_network) = match crate::net_utils::determine_receiving_interface(&src_addr.ip(), &local_ips) {
             Ok((ip, network)) => (ip, network),
             Err(e) => {
@@ -39,8 +55,11 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                 continue;
             }
         };
+        
         log::debug!("Receiving interface IP: {}, Network: {}", receiving_interface_ip, receiving_network);
-        match serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
+        
+        // Utiliser les données déchiffrées pour la désérialisation
+        match serde_json::from_slice::<serde_json::Value>(&decrypted) {
             Ok(json) => {
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
                     log::debug!("Received message type: {}", message_type);
@@ -105,7 +124,7 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                             let mut new_path = lsa.path.clone();
                                             new_path.push(receiving_interface_ip.clone());
                                             if let Err(e) = crate::lsa::forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, 
-                                                                      &lsa, new_path).await {
+                                                                                   &lsa, new_path, &state).await {
                                                 log::error!("Failed to forward LSA: {}", e);
                                             }
                                         } else {

@@ -98,6 +98,7 @@ pub async fn forward_lsa(
     router_ip: &str,
     original_lsa: &crate::types::LSAMessage,
     path: Vec<String>,
+    state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
 ) -> crate::error::Result<()> {
     if original_lsa.ttl <= 1 {
         return Ok(());
@@ -114,8 +115,8 @@ pub async fn forward_lsa(
         path,
         ttl: original_lsa.ttl - 1,
     };
-    let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
-    socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
+    
+    crate::net_utils::send_message(socket, addr, &message, state.key.as_slice(), "[FORWARD]").await?;
     info!("[FORWARD] LSA from {} (originator: {}, seq: {}) to {}", 
           router_ip, original_lsa.originator, original_lsa.seq_num, addr);
     Ok(())
@@ -227,7 +228,8 @@ pub async fn send_poisoned_route(
     router_ip: &str,
     poisoned_route: &str,
     seq_num: u32,
-    path: Vec<String>
+    path: Vec<String>,
+    state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
 ) -> crate::error::Result<()> {
     let mut routing_table = HashMap::new();
     routing_table.insert(poisoned_route.to_string(), crate::types::RouteState::Unreachable);
@@ -243,8 +245,8 @@ pub async fn send_poisoned_route(
         path,
         ttl: super::INITIAL_TTL,
     };
-    let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
-    socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
+    
+    crate::net_utils::send_message(socket, addr, &message, state.key.as_slice(), "[POISON]").await?;
     info!("[SEND] POISON ROUTE for {} from {} to {}", poisoned_route, router_ip, addr);
     Ok(())
 }
