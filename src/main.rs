@@ -62,10 +62,10 @@ impl AppState {
 }
 
 const PORT: u16 = 5000;
-const HELLO_INTERVAL_SEC: u64 = 20;
-const LSA_INTERVAL_SEC: u64 = 30;
-const NEIGHBOR_TIMEOUT_SEC: u64 = 60;
-const INITIAL_TTL: u8 = 64;
+const HELLO_INTERVAL_SEC: u64 = 5;
+const LSA_INTERVAL_SEC: u64 = 10;
+const NEIGHBOR_TIMEOUT_SEC: u64 = 22;
+const INITIAL_TTL: u8 = 15;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
