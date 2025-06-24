@@ -98,14 +98,14 @@ pub async fn send_message<T: serde::Serialize>(
     message: &T,
     key: &[u8],
     log_prefix: &str
-) -> crate::error::Result<()> {
+) -> Result<()> {
     let serialized = serde_json::to_vec(message)
-        .map_err(|e| crate::error::AppError::SerializationError(e))?;
+        .map_err(|e| AppError::SerializationError(e))?;
 
     let encrypted = encrypt(&serialized, key)?;
 
     socket.send_to(&encrypted, addr).await
-        .map_err(|e| crate::error::AppError::NetworkError(format!("Failed to send message: {}", e)))?;
+        .map_err(|e| AppError::NetworkError(format!("Failed to send message: {}", e)))?;
 
     log::info!("{} Encrypted message sent to {}", log_prefix, addr);
     Ok(())

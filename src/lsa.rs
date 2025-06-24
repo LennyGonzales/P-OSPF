@@ -8,10 +8,10 @@ use log::{info, warn, error, debug};
 use crate::types::{LSAMessage, RouteState};
 use crate::error::{AppError, Result};
 
-pub async fn update_topology(state: Arc<crate::AppState>, lsa: &crate::types::LSAMessage) -> crate::error::Result<()> {
+pub async fn update_topology(state: Arc<crate::AppState>, lsa: &crate::types::LSAMessage) -> Result<()> {
     let _current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| crate::error::AppError::ConfigError(e.to_string()))?
+        .map_err(|e| AppError::ConfigError(e.to_string()))?
         .as_secs();
     let mut topology = state.topology.lock().await;
     topology.insert(
@@ -99,7 +99,7 @@ pub async fn forward_lsa(
     original_lsa: &crate::types::LSAMessage,
     path: Vec<String>,
     state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
-) -> crate::error::Result<()> {
+) -> Result<()> {
     if original_lsa.ttl <= 1 {
         return Ok(());
     }
@@ -127,7 +127,7 @@ pub async fn update_routing_from_lsa(
     lsa: &crate::types::LSAMessage,
     sender_ip: &str,
     socket: &tokio::net::UdpSocket
-) -> crate::error::Result<()> {
+) -> Result<()> {
     let mut routing_table = state.routing_table.lock().await;
     let next_hop = sender_ip.to_string();
     if lsa.originator != state.local_ip {
@@ -230,7 +230,7 @@ pub async fn send_poisoned_route(
     seq_num: u32,
     path: Vec<String>,
     state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
-) -> crate::error::Result<()> {
+) -> Result<()> {
     let mut routing_table = HashMap::new();
     routing_table.insert(poisoned_route.to_string(), crate::types::RouteState::Unreachable);
     let message = crate::types::LSAMessage {
@@ -251,7 +251,7 @@ pub async fn send_poisoned_route(
     Ok(())
 }
 
-pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crate::error::Result<()> {
+pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
     use pnet::ipnetwork::IpNetwork;
     use pnet::datalink;
     
@@ -262,9 +262,9 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
     }
     
     let network: IpNetwork = destination.parse()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
+        .map_err(|e| AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
     let gateway_ip: Ipv4Addr = gateway.parse()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
+        .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
     if gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
         debug!("Skipping route to invalid gateway: {} via {}", destination, gateway);
         return Ok(());
@@ -308,11 +308,11 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
         }
     }
     let handle = net_route::Handle::new()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
+        .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
     let (ip, prefix) = match network {
         IpNetwork::V4(net) => (IpAddr::V4(net.network()), net.prefix()),
         IpNetwork::V6(_) => {
-            return Err(crate::error::AppError::RouteError("IPv6 not supported".to_string()));
+            return Err(AppError::RouteError("IPv6 not supported".to_string()));
         }
     };
     let route = net_route::Route::new(ip, prefix as u8)
@@ -332,7 +332,7 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
                 },
                 Err(e2) => {
                     warn!("Failed to add/update route to {} via {}: {}", destination, gateway_ip, e2);
-                    Err(crate::error::AppError::RouteError(format!("Routing update failed: {}", e2)))
+                    Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
                 }
             }
         }

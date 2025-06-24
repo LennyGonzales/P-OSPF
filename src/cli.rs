@@ -1,16 +1,10 @@
+use routing_project::*;
+use routing_project::read_config::read_router_config;
+
 use std::net::{UdpSocket, ToSocketAddrs, SocketAddr};
 use std::env;
 use serde::Serialize;
 use std::io::{self, Write, Read};
-
-mod net_utils;
-//use net_utils;
-// Update the import path to match your actual module structure.
-// For example, if read_config.rs is in the same directory:
-mod read_config;
-use read_config::read_router_config;
-// Or, if it's in a submodule, adjust accordingly:
-// use crate::some_submodule::read_config::read_router_config;
 
 #[derive(Serialize)]
 struct ControlMessage {
