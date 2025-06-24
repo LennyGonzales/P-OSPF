@@ -203,15 +203,26 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Resu
         return Ok(());
     }
     
+    // Analyser correctement le préfixe réseau pour obtenir l'adresse et la longueur du préfixe
     let network: IpNetwork = destination.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
+    
+    // Extraire le préfixe
+    let prefix_len = match network {
+        IpNetwork::V4(ipv4) => ipv4.prefix(),
+        IpNetwork::V6(ipv6) => ipv6.prefix(),
+    };
+    
     let gateway_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
+    
+    // Vérifications de base pour la passerelle
     if gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
         debug!("Skipping route to invalid gateway: {} via {}", destination, gateway);
         return Ok(());
     }
-    // Vérifier que la gateway est directement accessible (sur un réseau local)
+    
+    // Vérifier que la passerelle est directement accessible (sur un réseau local)
     let interfaces = datalink::interfaces();
     let mut gateway_is_local = false;
     let mut local_networks = Vec::new();
@@ -277,6 +288,49 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Resu
                     Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
                 }
             }
+        }
+    }
+}
+
+// Modifier la fonction update_system_route pour accepter le préfixe
+async fn update_system_route(destination: &str, gateway: &str, prefix_len: u8) -> Result<()> {
+    use rtnetlink::{new_connection, IpVersion};
+    use std::net::Ipv4Addr;
+    use tokio::time::{timeout, Duration};
+
+    // Parse destination et gateway en IPv4
+    let parts: Vec<&str> = destination.split('/').collect();
+    let dest_ip: Ipv4Addr = parts[0].parse()
+        .map_err(|e| AppError::RouteError(format!("Destination IPv4 invalide: {}", e)))?;
+    
+    let gw_ip: Ipv4Addr = gateway.parse()
+        .map_err(|e| AppError::RouteError(format!("Gateway IPv4 invalide: {}", e)))?;
+
+    // Crée une connexion netlink
+    let (connection, handle, _) = new_connection()
+        .map_err(|e| AppError::RouteError(format!("Erreur netlink: {}", e)))?;
+    tokio::spawn(connection);
+
+    // Ajoute ou remplace la route avec le préfixe correct
+    let fut = handle.route().add()
+        .v4()
+        .destination_prefix(dest_ip, prefix_len)  // Utilise le préfixe correct
+        .gateway(gw_ip)
+        .execute();
+
+    // Timeout pour éviter de bloquer indéfiniment
+    match timeout(Duration::from_secs(2), fut).await {
+        Ok(Ok(_)) => {
+            debug!("Route système mise à jour: {} via {}", destination, gateway);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            warn!("Erreur netlink lors de la mise à jour de la route: {}", e);
+            Err(AppError::RouteError(format!("Erreur netlink: {}", e)))
+        }
+        Err(_) => {
+            warn!("Timeout netlink lors de la mise à jour de la route");
+            Err(AppError::RouteError("Timeout netlink".into()))
         }
     }
 }

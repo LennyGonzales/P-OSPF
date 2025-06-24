@@ -8,6 +8,7 @@ use log::{info, debug, warn, error};
 use crate::types::{RouteState, Neighbor};
 use crate::error::{AppError, Result};
 use crate::AppState;
+use futures::stream::TryStreamExt;
 
 /// Représente un nœud dans le graphe du réseau
 #[derive(Debug, Clone)]
@@ -50,9 +51,11 @@ struct DijkstraNode {
 
 impl Ord for DijkstraNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Priorité : 1) Coût total minimum, 2) Nombre de sauts minimum (plus court chemin), 3) Capacité goulot maximale
+        // Priorité correcte basée sur le coût OSPF, pas le nombre de sauts
         other.total_cost.cmp(&self.total_cost)
-            .then_with(|| other.hop_count.cmp(&self.hop_count))
+            // En cas d'égalité de coût, préférer le chemin avec moins de sauts
+            .then_with(|| other.hop_count.cmp(&self.hop_count)) 
+            // En cas d'égalité des sauts, préférer le lien avec la meilleure capacité
             .then_with(|| self.bottleneck_capacity.cmp(&other.bottleneck_capacity))
     }
 }
@@ -120,59 +123,71 @@ impl NetworkTopology {
             .collect()
     }
 
+    /// Trouve un lien direct entre deux routeurs s'il existe
+    pub fn find_link(&self, from: &str, to: &str) -> Option<&NetworkLink> {
+        self.links.iter()
+            .find(|link| link.from == from && link.to == to)
+    }
+
     /// Calcule les meilleurs chemins depuis un routeur source
     /// Basé sur : 1) Plus court chemin (nombre de sauts), 2) Capacité goulot, 3) État des liens
     pub fn calculate_shortest_paths(&self, source: &str) -> HashMap<String, RouteInfo> {
+        let mut costs: HashMap<String, u32> = HashMap::new();
         let mut hop_counts: HashMap<String, u32> = HashMap::new();
         let mut bottleneck_capacities: HashMap<String, u32> = HashMap::new();
         let mut paths: HashMap<String, Vec<String>> = HashMap::new();
         let mut visited = HashSet::new();
         let mut heap = BinaryHeap::new();
 
-        // Initialisation
+        // Initialisation avec des valeurs infinies
         for node_id in self.nodes.keys() {
+            costs.insert(node_id.clone(), u32::MAX);
             hop_counts.insert(node_id.clone(), u32::MAX);
             bottleneck_capacities.insert(node_id.clone(), 0);
             paths.insert(node_id.clone(), Vec::new());
         }
 
         // Nœud source
+        costs.insert(source.to_string(), 0);
         hop_counts.insert(source.to_string(), 0);
         bottleneck_capacities.insert(source.to_string(), u32::MAX);
         paths.insert(source.to_string(), vec![source.to_string()]);
 
         heap.push(DijkstraNode {
             router_id: source.to_string(),
-            total_cost: 0,
+            total_cost: 0,  // Coût total commence à 0
             hop_count: 0,
             bottleneck_capacity: u32::MAX,
             path: vec![source.to_string()],
         });
 
-        // Algorithme modifié pour la capacité goulot d'étranglement
+        // Algorithme de Dijkstra
         while let Some(current) = heap.pop() {
             if visited.contains(&current.router_id) {
                 continue;
             }
             visited.insert(current.router_id.clone());
 
-            // Explorer les voisins
+            // Explorer les voisins actifs uniquement
             for link in self.get_active_neighbors(&current.router_id) {
                 if visited.contains(&link.to) {
                     continue;
                 }
 
+                // Calculer le nouveau coût en additionnant le coût du lien
+                let new_cost = match current.total_cost.checked_add(link.cost) {
+                    Some(cost) => cost,
+                    None => continue, // Éviter les débordements pour les chemins infinis
+                };
+                
                 let new_hop_count = current.hop_count + 1;
                 let new_bottleneck_capacity = current.bottleneck_capacity.min(link.capacity_mbps);
                 
-                let current_best_hops = *hop_counts.get(&link.to).unwrap_or(&u32::MAX);
-                let current_best_capacity = *bottleneck_capacities.get(&link.to).unwrap_or(&0);
+                let current_best_cost = *costs.get(&link.to).unwrap_or(&u32::MAX);
 
-                // Critères de mise à jour : nombre de sauts principal, puis capacité goulot
-                let should_update = new_hop_count < current_best_hops ||
-                    (new_hop_count == current_best_hops && new_bottleneck_capacity > current_best_capacity);
-
-                if should_update {
+                // Mettre à jour si on a trouvé un chemin avec un meilleur coût OSPF
+                if new_cost < current_best_cost {
+                    costs.insert(link.to.clone(), new_cost);
                     hop_counts.insert(link.to.clone(), new_hop_count);
                     bottleneck_capacities.insert(link.to.clone(), new_bottleneck_capacity);
                     
@@ -182,7 +197,7 @@ impl NetworkTopology {
 
                     heap.push(DijkstraNode {
                         router_id: link.to.clone(),
-                        total_cost: new_hop_count,
+                        total_cost: new_cost,  // Coût total mis à jour
                         hop_count: new_hop_count,
                         bottleneck_capacity: new_bottleneck_capacity,
                         path: new_path,
@@ -193,16 +208,16 @@ impl NetworkTopology {
 
         // Construire les résultats
         let mut routes = HashMap::new();
-        for (dest, hops) in hop_counts {
-            if dest != source && hops != u32::MAX {
+        for (dest, cost) in costs {
+            if dest != source && cost != u32::MAX {
                 let path = paths.get(&dest).unwrap_or(&Vec::new()).clone();
                 let next_hop = if path.len() > 1 { path[1].clone() } else { dest.clone() };
                 
                 routes.insert(dest.clone(), RouteInfo {
                     destination: dest.clone(),
                     next_hop,
-                    total_cost: hops,
-                    hop_count: hops,
+                    total_cost: cost,  // Utiliser le coût OSPF calculé
+                    hop_count: *hop_counts.get(&dest).unwrap_or(&0),
                     bottleneck_capacity: *bottleneck_capacities.get(&dest).unwrap_or(&0),
                     path,
                     is_reachable: true,
@@ -228,19 +243,31 @@ pub struct RouteInfo {
 
 /// Calcule le coût OSPF basé sur la capacité et l'état
 pub fn calculate_ospf_cost(capacity_mbps: u32, is_active: bool) -> u32 {
+    // Coût infini pour les liens inactifs
     if !is_active {
-        return u32::MAX; // Coût infini pour les liens inactifs
+        return u32::MAX;
     }
     
+    // Éviter la division par zéro
     if capacity_mbps == 0 {
         return u32::MAX;
     }
     
-    // Formule OSPF standard : 100 Mbps de référence
-    let reference_bandwidth = 100_000_000; // 100 Mbps en bps
-    let bandwidth_bps = capacity_mbps * 1_000_000;
-    let cost = reference_bandwidth / bandwidth_bps;
-    cost.max(1) // Coût minimum de 1
+    // Formule OSPF standard : référence de 100 Mbps (100 000 000 bps)
+    // Le coût OSPF est l'inverse de la bande passante
+    let reference_bandwidth = 100_000_000u64; // 100 Mbps en bps
+    let bandwidth_bps = capacity_mbps as u64 * 1_000_000;
+    
+    // Vérification supplémentaire contre la division par zéro
+    if bandwidth_bps == 0 {
+        return u32::MAX;
+    }
+    
+    // Utiliser u64 pour éviter les problèmes de dépassement
+    let cost = (reference_bandwidth / bandwidth_bps) as u32;
+    
+    // Coût minimum de 1 (même pour les liens très rapides)
+    cost.max(1)
 }
 
 /// Construit la topologie réseau à partir de l'état OSPF
@@ -290,15 +317,16 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
     // Construire la topologie
     let topology = build_network_topology(Arc::clone(&state)).await;
     
-    // Calculer les meilleurs chemins vers chaque routeur
+    // Calculer les meilleurs chemins depuis le routeur local
     let shortest_paths = topology.calculate_shortest_paths(&state.local_ip);
     
     if shortest_paths.is_empty() {
-        debug!("Aucune route calculée - routeur probablement isolé");
+        warn!("Aucune route calculée - routeur probablement isolé");
         return Ok(());
     }
     
     let mut new_routing_table = HashMap::new();
+    let mut routes_updated = 0; // Compteur des routes mises à jour
     let lsdb = state.topology.lock().await;
 
     // Parcourir la LSDB pour trouver les réseaux annoncés
@@ -306,17 +334,45 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
         if let Some(lsa) = &router_state.last_lsa {
             // Trouver le chemin vers cet originator
             if let Some(route_info) = shortest_paths.get(originator) {
-                // Parcourir les routes annoncées par cet originator
-                for (network_prefix, route_state) in &lsa.routing_table {
-                    if let RouteState::Active(_) = route_state {
-                        // Ajouter la route à notre table de routage interne
-                        new_routing_table.insert(
-                            network_prefix.clone(),
-                            (route_info.next_hop.clone(), route_state.clone()),
-                        );
-                        // Mettre à jour la table de routage système
-                        if let Err(e) = crate::lsa::update_routing_table_safe(network_prefix, &route_info.next_hop).await {
-                            warn!("Échec de la mise à jour de la route système vers {} via {}: {}", network_prefix, &route_info.next_hop, e);
+                if route_info.is_reachable && route_info.total_cost < u32::MAX {
+                    // Parcourir les routes annoncées par cet originator
+                    for (network_prefix, route_state) in &lsa.routing_table {
+                        if let RouteState::Active(metric) = route_state {
+                            // Calculer le coût total (coût local + métrique distante)
+                            let total_metric = if *metric == u32::MAX || route_info.total_cost == u32::MAX {
+                                u32::MAX
+                            } else {
+                                route_info.total_cost.saturating_add(*metric)
+                            };
+                            
+                            // Vérifier si cette route est meilleure que celles déjà connues
+                            let should_update = match new_routing_table.get(network_prefix) {
+                                Some((_, RouteState::Active(current_metric))) => total_metric < *current_metric,
+                                Some((_, RouteState::Unreachable)) => true,
+                                None => true,
+                            };
+                            
+                            if should_update {
+                                routes_updated += 1; // Correction : incrémenter le compteur
+                                // Ajouter la route à notre table de routage interne
+                                new_routing_table.insert(
+                                    network_prefix.clone(),
+                                    (route_info.next_hop.clone(), RouteState::Active(total_metric)),
+                                );
+                                
+                                // Ne mettre à jour la table système que si le préfixe est valide
+                                if network_prefix.contains('/') {
+                                    if let Err(e) = crate::lsa::update_routing_table_safe(network_prefix, &route_info.next_hop).await {
+                                        warn!("Échec de la mise à jour de la route système vers {} via {}: {}", 
+                                              network_prefix, &route_info.next_hop, e);
+                                    } else {
+                                        info!("Route mise à jour: {} via {} (coût: {})", 
+                                              network_prefix, &route_info.next_hop, total_metric);
+                                    }
+                                } else {
+                                    debug!("Préfixe invalide ignoré: {}", network_prefix);
+                                }
+                            }
                         }
                     }
                 }
@@ -328,43 +384,82 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
     let mut routing_table = state.routing_table.lock().await;
     *routing_table = new_routing_table;
     
-    debug!("Calcul des routes terminé. {} routes dans la table.", routing_table.len());
+    info!("Calcul des routes terminé. {} routes dans la table de routage ({} mises à jour).", 
+          routing_table.len(), routes_updated);
     Ok(())
 }
 
-/// Met à jour une route dans la table de routage système en utilisant la bibliothèque rtnetlink (pour Linux, IPv4 uniquement)
+/// Met à jour une route dans la table de routage système
 async fn update_system_route(destination: &str, gateway: &str) -> Result<()> {
     use rtnetlink::{new_connection, IpVersion};
     use std::net::Ipv4Addr;
     use tokio::time::{timeout, Duration};
+    use pnet::ipnetwork::IpNetwork;
 
-    // Parse destination et gateway en IPv4
-    let dest_ip: Ipv4Addr = destination.parse().map_err(|e| AppError::RouteError(format!("Destination IPv4 invalide: {}", e)))?;
-    let gw_ip: Ipv4Addr = gateway.parse().map_err(|e| AppError::RouteError(format!("Gateway IPv4 invalide: {}", e)))?;
+    // Vérifier que la destination est un réseau avec préfixe (CIDR)
+    if !destination.contains('/') {
+        return Err(AppError::RouteError(format!("Format de destination invalide (CIDR attendu): {}", destination)));
+    }
 
-    // Crée une connexion netlink
-    let (connection, handle, _) = new_connection().map_err(|e| AppError::RouteError(format!("Erreur netlink: {}", e)))?;
+    // Analyser le réseau de destination
+    let network: IpNetwork = destination.parse()
+        .map_err(|e| AppError::RouteError(format!("Analyse du réseau destination échouée {}: {}", destination, e)))?;
+
+    // Extraire l'adresse et le préfixe
+    let (dest_ip, prefix_len) = match network {
+        IpNetwork::V4(ipv4) => (ipv4.network(), ipv4.prefix()),
+        IpNetwork::V6(_) => return Err(AppError::RouteError("IPv6 non supporté".to_string())),
+    };
+
+    // Analyser la passerelle
+    let gw_ip: Ipv4Addr = gateway.parse()
+        .map_err(|e| AppError::RouteError(format!("Passerelle IPv4 invalide {}: {}", gateway, e)))?;
+
+    // Vérifier la validité de la passerelle
+    if gw_ip.is_unspecified() || gw_ip.is_broadcast() || gw_ip.is_loopback() {
+        return Err(AppError::RouteError(format!("Adresse de passerelle invalide: {}", gw_ip)));
+    }
+
+    // Créer une connexion netlink
+    let (connection, handle, _) = match new_connection() {
+        Ok(conn) => conn,
+        Err(e) => return Err(AppError::RouteError(format!("Échec de connexion netlink: {}", e))),
+    };
     tokio::spawn(connection);
 
-    // Ajoute ou remplace la route (prefix /32 pour une IP unique)
-    let fut = handle.route().add()
+    // Essayer d'abord de supprimer la route existante
+    let mut routes = handle.route().get(IpVersion::V4).execute();
+    let mut route_existed = false;
+    
+    while let Ok(Ok(Some(route))) = timeout(Duration::from_secs(1), routes.try_next()).await {
+        if route.destination_prefix() == Some((std::net::IpAddr::V4(dest_ip), prefix_len as u8)) {
+            route_existed = true;
+            match handle.route().del(route).execute().await {
+                Ok(_) => debug!("Route existante supprimée: {} via {}", destination, gateway),
+                Err(e) => debug!("Erreur lors de la suppression de la route existante: {}", e),
+            }
+        }
+    }
+
+    // Ajouter la nouvelle route avec un message approprié
+    let add_route = handle.route().add()
         .v4()
-        .destination_prefix(dest_ip, 32)
+        .destination_prefix(dest_ip, prefix_len as u8)
         .gateway(gw_ip)
         .execute();
 
-    // Timeout pour éviter de bloquer indéfiniment
-    match timeout(Duration::from_secs(2), fut).await {
+    match timeout(Duration::from_secs(2), add_route).await {
         Ok(Ok(_)) => {
-            debug!("Route système mise à jour: {} via {}", destination, gateway);
+            let action = if route_existed { "mise à jour" } else { "ajoutée" };
+            info!("Route système {}: {} via {}", action, destination, gateway);
             Ok(())
         }
         Ok(Err(e)) => {
-            warn!("Erreur netlink lors de la mise à jour de la route: {}", e);
+            error!("Erreur netlink lors de l'ajout de la route: {}", e);
             Err(AppError::RouteError(format!("Erreur netlink: {}", e)))
         }
         Err(_) => {
-            warn!("Timeout netlink lors de la mise à jour de la route");
+            error!("Timeout netlink lors de l'ajout de la route");
             Err(AppError::RouteError("Timeout netlink".into()))
         }
     }

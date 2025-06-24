@@ -898,6 +898,7 @@ dependencies = [
  "cbc",
  "cipher",
  "env_logger",
+ "futures",
  "hostname",
  "log",
  "net-route",
