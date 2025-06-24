@@ -7,3 +7,6 @@ link_active = true
 name = "eth1"
 capacity_mbps = 1000    # R_3
 link_active = true
+
+[[key]]
+key = "1Jq4357rFRYk/GdtFN0qTlE7Q7BVv7NMcuD2+wDqZD3JWB7/RWALAoY6aVxlyo/K"
