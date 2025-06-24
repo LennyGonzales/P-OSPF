@@ -76,3 +76,46 @@ pub fn calculate_broadcast_for_interface(interface_ip: &str, ip_network: &IpNetw
         Err(AppError::NetworkError("Invalid IPv4 network".to_string()))
     }
 }
+
+/// Fonction générique pour envoyer n'importe quel type de message sérialisable
+/// 
+/// # Arguments
+/// * `socket` - Le socket UDP à utiliser pour l'envoi
+/// * `addr` - L'adresse de destination
+/// * `message` - Le message à envoyer (doit implémenter Serialize)
+/// * `message_type` - Type du message (1: HELLO, 2: LSA, 3: Commande)
+/// * `log_prefix` - Préfixe pour les logs (ex: "[SEND]", "[CLI]")
+/// 
+/// # Returns
+/// * `Result<()>` - Ok si le message a été envoyé, Err sinon
+pub async fn send_message<T: serde::Serialize>(
+    socket: &tokio::net::UdpSocket,
+    addr: &std::net::SocketAddr,
+    message: &T,
+    log_prefix: &str
+) -> crate::error::Result<()> {
+    let serialized = serde_json::to_vec(message)
+        .map_err(|e| crate::error::AppError::SerializationError(e))?;
+    
+    socket.send_to(&serialized, addr).await
+        .map_err(|e| crate::error::AppError::NetworkError(format!("Failed to send message: {}", e)))?;
+    
+    log::info!("{} Message sent to {}", log_prefix, addr);
+    Ok(())
+}
+
+/// Fonction d'aide pour envoyer un message texte simple (réponses CLI)
+pub async fn send_text_response(
+    socket: &tokio::net::UdpSocket,
+    addr: &std::net::SocketAddr,
+    response: &str,
+    log_context: &str
+) -> crate::error::Result<()> {
+    socket.send_to(response.as_bytes(), addr).await
+        .map_err(|e| crate::error::AppError::NetworkError(
+            format!("Failed to send {} response: {}", log_context, e)
+        ))?;
+    
+    log::debug!("[CLI] Sent {} response to {}", log_context, addr);
+    Ok(())
+}

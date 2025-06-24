@@ -30,7 +30,7 @@ pub async fn send_lsa(
     state: std::sync::Arc<crate::AppState>,
     seq_num: u32,
     path: Vec<String>
-) -> crate::error::Result<()> {
+) -> Result<()> {
     let neighbors_guard = state.neighbors.lock().await;
     let neighbors_vec = neighbors_guard.values().cloned().collect::<Vec<_>>();
     drop(neighbors_guard);
@@ -89,11 +89,7 @@ pub async fn send_lsa(
         ttl: super::INITIAL_TTL,
     };
 
-    let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
-    socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
-    info!("[SEND] LSA from {} (originator: {}, seq: {}) to {}", 
-          router_ip, originator, seq_num, addr);
-    Ok(())
+    crate::net_utils::send_message(socket, addr, &message, "[SEND] LSA").await
 }
 
 pub async fn forward_lsa(

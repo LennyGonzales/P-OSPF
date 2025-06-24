@@ -122,8 +122,8 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                     "connexion" => {
                                         log::info!("[CLI] New connection from {}", src_addr);
                                         let response = "Connexion établie avec succès";
-                                        if let Err(e) = socket.send_to(response.as_bytes(), src_addr).await {
-                                            log::warn!("[CLI] Failed to send connexion response: {}", e);
+                                        if let Err(e) = crate::net_utils::send_text_response(&socket, &src_addr, response, "connexion").await {
+                                            log::warn!("{}", e);
                                         }
                                     },
                                     "enable" => {
