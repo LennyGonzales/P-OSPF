@@ -91,21 +91,17 @@ impl NetworkTopology {
     /// Ajoute un lien bidirectionnel entre deux routeurs
     pub fn add_link(&mut self, from: String, to: String, capacity_mbps: u32, is_active: bool) {
         let cost = calculate_ospf_cost(capacity_mbps, is_active);
-        
-        // Lien direct
+        let (a, b) = if from < to { (from, to) } else { (to, from) };
+        // Log pour debug flapping
+        info!("[TOPO] Ajout lien {} <-> {} | capacité: {} Mbps | actif: {} | coût: {}", a, b, capacity_mbps, is_active, cost);
+        let already_exists = self.links.iter().any(|l| l.from == a && l.to == b);
+        if already_exists {
+            info!("[TOPO] Lien {} <-> {} déjà présent, ignoré", a, b);
+            return;
+        }
         self.links.push(NetworkLink {
-            from: from.clone(),
-            to: to.clone(),
-            cost,
-            capacity_mbps,
-            is_active,
-            hop_count: 1,
-        });
-        
-        // Lien de retour (bidirectionnel)
-        self.links.push(NetworkLink {
-            from: to,
-            to: from,
+            from: a,
+            to: b,
             cost,
             capacity_mbps,
             is_active,
@@ -116,7 +112,7 @@ impl NetworkTopology {
     /// Trouve les voisins actifs d'un routeur
     pub fn get_active_neighbors(&self, router_id: &str) -> Vec<&NetworkLink> {
         self.links.iter()
-            .filter(|link| link.from == router_id && link.is_active)
+            .filter(|link| (link.from == router_id || link.to == router_id) && link.is_active)
             .collect()
     }
 
@@ -158,30 +154,37 @@ impl NetworkTopology {
 
             // Explorer les voisins
             for link in self.get_active_neighbors(&current.router_id) {
-                if visited.contains(&link.to) {
+                // Déterminer le voisin (l'autre extrémité du lien)
+                let neighbor = if link.from == current.router_id {
+                    &link.to
+                } else {
+                    &link.from
+                };
+                
+                if visited.contains(neighbor) {
                     continue;
                 }
 
                 let new_hop_count = current.hop_count + 1;
                 let new_bottleneck_capacity = current.bottleneck_capacity.min(link.capacity_mbps);
                 
-                let current_best_hops = *hop_counts.get(&link.to).unwrap_or(&u32::MAX);
-                let current_best_capacity = *bottleneck_capacities.get(&link.to).unwrap_or(&0);
+                let current_best_hops = *hop_counts.get(neighbor).unwrap_or(&u32::MAX);
+                let current_best_capacity = *bottleneck_capacities.get(neighbor).unwrap_or(&0);
 
                 // Critères de mise à jour : nombre de sauts principal, puis capacité goulot
                 let should_update = new_hop_count < current_best_hops ||
                     (new_hop_count == current_best_hops && new_bottleneck_capacity > current_best_capacity);
 
                 if should_update {
-                    hop_counts.insert(link.to.clone(), new_hop_count);
-                    bottleneck_capacities.insert(link.to.clone(), new_bottleneck_capacity);
+                    hop_counts.insert(neighbor.clone(), new_hop_count);
+                    bottleneck_capacities.insert(neighbor.clone(), new_bottleneck_capacity);
                     
                     let mut new_path = current.path.clone();
-                    new_path.push(link.to.clone());
-                    paths.insert(link.to.clone(), new_path.clone());
+                    new_path.push(neighbor.clone());
+                    paths.insert(neighbor.clone(), new_path.clone());
 
                     heap.push(DijkstraNode {
-                        router_id: link.to.clone(),
+                        router_id: neighbor.clone(),
                         total_cost: new_hop_count,
                         hop_count: new_hop_count,
                         bottleneck_capacity: new_bottleneck_capacity,
@@ -238,7 +241,7 @@ pub fn calculate_ospf_cost(capacity_mbps: u32, is_active: bool) -> u32 {
     
     // Formule OSPF standard : 100 Mbps de référence
     let reference_bandwidth = 100_000_000; // 100 Mbps en bps
-    let bandwidth_bps = capacity_mbps * 1_000_000;
+    let bandwidth_bps = capacity_mbps * 1_000;
     let cost = reference_bandwidth / bandwidth_bps;
     cost.max(1) // Coût minimum de 1
 }
@@ -246,40 +249,28 @@ pub fn calculate_ospf_cost(capacity_mbps: u32, is_active: bool) -> u32 {
 /// Construit la topologie réseau à partir de l'état OSPF
 pub async fn build_network_topology(state: Arc<AppState>) -> NetworkTopology {
     let mut topology = NetworkTopology::new();
-    
-    // Ajouter le routeur local
-    let local_interfaces = state.config.interfaces.iter().map(|iface| {
-        InterfaceInfo {
-            name: iface.name.clone(),
-            network: format!("network_{}", iface.name), // Simplification
-            capacity_mbps: iface.capacity_mbps,
-            is_active: iface.link_active,
-            connected_to: None,
-        }
-    }).collect();
-    
-    topology.add_router(state.local_ip.clone(), local_interfaces);
-    
-    // Ajouter les voisins et leurs liens
-    let neighbors = state.neighbors.lock().await;
-    for (neighbor_ip, neighbor) in neighbors.iter() {
-        // Ajouter le voisin s'il n'existe pas
-        if !topology.nodes.contains_key(neighbor_ip) {
-            topology.add_router(neighbor_ip.clone(), Vec::new());
-        }
-        
-        // Ajouter le lien si le voisin est actif
-        if neighbor.link_up {
-            topology.add_link(
-                state.local_ip.clone(),
-                neighbor_ip.clone(),
-                neighbor.capacity,
-                true,
-            );
+    let lsa_db = state.lsa_db.lock().await;
+    for (_originator, lsa) in lsa_db.iter() {
+        // Nettoyer l'identifiant du routeur (enlever /24 éventuel)
+        let router_id = lsa.originator.split('/').next().unwrap_or(&lsa.originator).to_string();
+        let interfaces = lsa.neighbors.iter().map(|n| {
+            InterfaceInfo {
+                name: format!("iface_to_{}", n.neighbor_ip),
+                network: format!("net_to_{}", n.neighbor_ip),
+                capacity_mbps: n.capacity,
+                is_active: n.link_up,
+                connected_to: Some(n.neighbor_ip.clone()),
+            }
+        }).collect();
+        topology.add_router(router_id.clone(), interfaces);
+        for n in &lsa.neighbors {
+            if n.link_up {
+                let neighbor_id = n.neighbor_ip.split('/').next().unwrap_or(&n.neighbor_ip).to_string();
+                topology.add_link(router_id.clone(), neighbor_id, n.capacity, n.link_up);
+            }
         }
     }
-    drop(neighbors);
-    
+    drop(lsa_db);
     topology
 }
 
@@ -289,6 +280,31 @@ pub async fn calculate_and_update_optimal_routes(state: Arc<AppState>) -> Result
     
     // Construire la topologie
     let topology = build_network_topology(Arc::clone(&state)).await;
+    
+    // Afficher la topologie complète
+    info!("\n--- TOPOLOGIE COMPLÈTE DU RÉSEAU ---");
+    info!("Noeuds et interfaces:");
+    for (id, node) in &topology.nodes {
+        let mut ifaces = String::new();
+        for iface in &node.interfaces {
+            if !ifaces.is_empty() {
+                ifaces.push_str(", ");
+            }
+            ifaces.push_str(&format!("{}:{}Mbps{}", iface.name, iface.capacity_mbps, if iface.is_active {""} else {" (down)"}));
+            if let Some(ip) = &iface.connected_to {
+                ifaces.push_str(&format!("->{}", ip));
+            }
+            if !iface.network.is_empty() {
+                ifaces.push_str(&format!(" [net:{}]", iface.network));
+            }
+        }
+        info!("  - {} [{}]", id, ifaces);
+    }
+    info!("Liens (tous):");
+    for link in &topology.links {
+        info!("  {} -> {} | coût: {} | capacité: {} Mbps | actif: {}", link.from, link.to, link.cost, link.capacity_mbps, link.is_active);
+    }
+    info!("--------------------------\n");
     
     // Calculer les meilleurs chemins
     let routes = topology.calculate_shortest_paths(&state.local_ip);

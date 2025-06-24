@@ -92,7 +92,7 @@ impl InterfaceState {
         }
         
         let reference_bandwidth = 100_000_000; // 100 Mbps en bps
-        let bandwidth_bps = self.capacity_mbps * 1_000_000;
+        let bandwidth_bps = self.capacity_mbps * 1_000;
         let cost = reference_bandwidth / bandwidth_bps;
         cost.max(1) // Le coût minimum est 1
     }

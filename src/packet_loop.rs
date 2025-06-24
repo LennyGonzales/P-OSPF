@@ -84,11 +84,16 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                     }
                                 };
                                 if should_process && lsa.ttl > 0 {
+                                    // Stocker ou mettre à jour la LSA dans la base globale
+                                    {
+                                        let mut lsa_db = state.lsa_db.lock().await;
+                                        lsa_db.insert(lsa.originator.clone(), lsa.clone());
+                                    }
                                     if lsa.originator != receiving_interface_ip {
                                         let path_contains_us = lsa.path.contains(&receiving_interface_ip);
                                         if !path_contains_us {
                                             if let Err(e) = crate::lsa::update_routing_from_lsa(std::sync::Arc::clone(&state), &lsa, 
-                                                                                  &src_addr.ip().to_string(), &socket).await {
+                                                  &src_addr.ip().to_string(), &socket).await {
                                                 log::error!("Failed to update routing from LSA: {}", e);
                                             }
                                             if let Err(e) = crate::lsa::update_topology(std::sync::Arc::clone(&state), &lsa).await {
@@ -98,7 +103,7 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                             let mut new_path = lsa.path.clone();
                                             new_path.push(receiving_interface_ip.clone());
                                             if let Err(e) = crate::lsa::forward_lsa(&socket, &broadcast_addr, &receiving_interface_ip, 
-                                                                      &lsa, new_path).await {
+                                      &lsa, new_path).await {
                                                 log::error!("Failed to forward LSA: {}", e);
                                             }
                                         } else {

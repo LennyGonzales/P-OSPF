@@ -17,6 +17,7 @@ pub fn init_state(router_ip: String, config: crate::read_config::RouterConfig) -
         neighbors: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         routing_table: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         processed_lsa: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        lsa_db: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         local_ip: router_ip,
         enabled: tokio::sync::Mutex::new(true), // OSPF activé par défaut
         config,
