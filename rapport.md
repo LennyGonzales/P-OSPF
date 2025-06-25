@@ -1,7 +1,8 @@
 # Rapport du projet P-OSPF
 
-Lenny Gonzales
-Nils Saadi
+Lenny Gonzales - INFRES 17 DL
+
+Nils Saadi - INFRES 17 DL
 
 ## Présentation générale
 
@@ -19,8 +20,7 @@ La découverte du réseau repose sur l’échange de messages **Hello** entre ro
 Un paquet HELLO contient généralement :
 - L’identifiant du routeur émetteur
 - L’adresse de l’interface source
-- Un identifiant de session ou timestamp
-- Une authentification (optionnelle)
+- Un identifiant de paquet
 - La liste des voisins connus sur l’interface
 
 Cela permet de vérifier la bidirectionnalité du lien et d’initier la relation de voisinage.
@@ -41,8 +41,7 @@ Lorsqu'un routeur reçoit un paquet HELLO :
 Un paquet LSA contient :
 - L’identifiant du routeur émetteur
 - La liste de ses voisins directs (et le coût de chaque lien)
-- Un numéro de séquence (pour la fraîcheur)
-- Un champ d’authentification (optionnel)
+- Un numéro de séquence 
 
 Chaque LSA décrit donc la connectivité locale d’un routeur.
 
@@ -197,3 +196,11 @@ Ce traitement garantit que chaque routeur démarre avec la bonne configuration r
 L'intégralité du code source du projet P-OSPF est disponible sur GitHub. Vous pouvez le consulter, le cloner et contribuer à l'adresse suivante :
 
 https://github.com/LennyGonzales/P-OSPF
+
+---
+
+## 8. Performances détaillées
+
+Pour une analyse approfondie des temps de convergence, de la robustesse, de l’utilisation des ressources et des limites du protocole, se référer au **rapport de performance** (fichier `rapport_performance.md`). Ce document fournit des mesures concrètes, des formules de calcul et des recommandations pour l’optimisation de P-OSPF.
+
+---
