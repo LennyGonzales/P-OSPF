@@ -94,7 +94,6 @@ impl NetworkTopology {
     /// Ajoute un lien bidirectionnel entre deux routeurs
     pub fn add_link(&mut self, from: String, to: String, capacity_mbps: u32, is_active: bool) {
         let cost = calculate_ospf_cost(capacity_mbps, is_active);
-        
         // Lien direct
         self.links.push(NetworkLink {
             from: from.clone(),
@@ -104,13 +103,37 @@ impl NetworkTopology {
             is_active,
             hop_count: 1,
         });
-        
         // Lien de retour (bidirectionnel)
         self.links.push(NetworkLink {
             from: to,
             to: from,
             cost,
             capacity_mbps,
+            is_active,
+            hop_count: 1,
+        });
+    }
+
+    /// Ajoute un lien bidirectionnel entre deux routeurs
+    /// Correction : utilise la capacité minimale entre les deux interfaces pour le coût OSPF
+    pub fn add_link_with_min_capacity(&mut self, from: String, to: String, local_capacity: u32, neighbor_capacity: u32, is_active: bool) {
+        let min_capacity = local_capacity.min(neighbor_capacity);
+        let cost = calculate_ospf_cost(min_capacity, is_active);
+        // Lien direct
+        self.links.push(NetworkLink {
+            from: from.clone(),
+            to: to.clone(),
+            cost,
+            capacity_mbps: min_capacity,
+            is_active,
+            hop_count: 1,
+        });
+        // Lien de retour (bidirectionnel)
+        self.links.push(NetworkLink {
+            from: to,
+            to: from,
+            cost,
+            capacity_mbps: min_capacity,
             is_active,
             hop_count: 1,
         });
@@ -297,10 +320,11 @@ pub async fn build_network_topology(state: Arc<AppState>) -> NetworkTopology {
         
         // Ajouter le lien si le voisin est actif
         if neighbor.link_up {
-            topology.add_link(
+            topology.add_link_with_min_capacity(
                 state.local_ip.clone(),
                 neighbor_ip.clone(),
                 neighbor.capacity,
+                neighbor.capacity, // Utiliser la capacité voisine pour le coût
                 true,
             );
         }
