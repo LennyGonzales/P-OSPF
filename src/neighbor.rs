@@ -5,7 +5,7 @@ use tokio::net::UdpSocket;
 use log::{info, warn, error};
 use crate::AppState;
 use std::time::Duration;
-use crate::dijkstra::calculate_ospf_cost; // Add this import
+use crate::dijkstra::{self, calculate_ospf_cost}; // Ajout de 'self' pour importer le module lui-même
 
 use crate::net_utils::get_broadcast_addresses;
 
@@ -54,8 +54,8 @@ pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
     tokio::spawn(async move {
         // Attendre un peu pour que les changements se stabilisent
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        if let Err(e) = crate::dijkstra::calculate_and_update_optimal_routes(state_clone).await {
-            log::warn!("Échec du recalcul des routes après changement de voisin: {}", e);
+        if let Err(e) = crate::dijkstra::calculate_and_update_optimal_routes(Arc::clone(&state_clone)).await {
+            warn!("Échec du calcul initial des routes: {}", e);
         }
     });
 }

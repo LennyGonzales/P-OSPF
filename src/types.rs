@@ -38,7 +38,15 @@ pub struct LSAMessage {
 }
 
 #[derive(Debug, Clone)]
-pub struct Router {}
+pub struct Router {
+    pub last_lsa: Option<LSAMessage>,
+}
+
+impl Router {
+    pub fn new() -> Self {
+        Self { last_lsa: None }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct InterfaceState {

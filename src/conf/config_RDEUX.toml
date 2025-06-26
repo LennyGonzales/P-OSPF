@@ -1,14 +1,16 @@
 [[interfaces]]
 name = "eth1"           # vm => eth0
-capacity_mbps = 100     # R_1 and R_4
+capacity_mbps = 10     # R_1 and R_4
 link_active = true
 
 [[interfaces]]
 name = "eth2"           # vm => eth1
-capacity_mbps = 100     # R_4 and R_5
+capacity_mbps = 10     # R_4 and R_5
 link_active = true
 
 [[interfaces]]
 name = "eth0"            # vm => eth2
-capacity_mbps = 1000     # t_A2
+capacity_mbps = 10     # t_A2
 link_active = true
+
+key = "1Jq4357rFRYk/GdtFN0qTlE7Q7BVv7NMcuD2+wDqZD3JWB7/RWALAoY6aVxlyo/K"

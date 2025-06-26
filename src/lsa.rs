@@ -8,16 +8,17 @@ use log::{info, warn, error, debug};
 use crate::types::{LSAMessage, RouteState};
 use crate::error::{AppError, Result};
 
-pub async fn update_topology(state: Arc<crate::AppState>, lsa: &crate::types::LSAMessage) -> crate::error::Result<()> {
-    let _current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| crate::error::AppError::ConfigError(e.to_string()))?
-        .as_secs();
+pub async fn update_topology(state: Arc<crate::AppState>, lsa: &crate::types::LSAMessage) -> Result<()> {
     let mut topology = state.topology.lock().await;
-    topology.insert(
-        lsa.originator.clone(),
-        crate::types::Router {},
-    );
+
+    let router_state = topology.entry(lsa.originator.clone()).or_insert_with(crate::types::Router::new);
+
+    // Ne mettre à jour que si le nouveau LSA est plus récent
+    if router_state.last_lsa.as_ref().map_or(true, |old_lsa| lsa.seq_num > old_lsa.seq_num) {
+        router_state.last_lsa = Some(lsa.clone());
+        debug!("Updated topology for originator {}", lsa.originator);
+    }
+    
     Ok(())
 }
 
@@ -30,7 +31,7 @@ pub async fn send_lsa(
     state: std::sync::Arc<crate::AppState>,
     seq_num: u32,
     path: Vec<String>
-) -> crate::error::Result<()> {
+) -> Result<()> {
     let neighbors_guard = state.neighbors.lock().await;
     let neighbors_vec = neighbors_guard.values().cloned().collect::<Vec<_>>();
     drop(neighbors_guard);
@@ -89,140 +90,78 @@ pub async fn send_lsa(
         ttl: super::INITIAL_TTL,
     };
 
-    let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
-    socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
-    info!("[SEND] LSA from {} (originator: {}, seq: {}) to {}", 
-          router_ip, originator, seq_num, addr);
-    Ok(())
+    crate::net_utils::send_message(socket, addr, &message, state.key.as_slice(),"[SEND] LSA").await
 }
 
 pub async fn forward_lsa(
     socket: &tokio::net::UdpSocket,
-    addr: &std::net::SocketAddr,
-    router_ip: &str,
+    _broadcast_addr: &std::net::SocketAddr, // ignoré, on envoie unicast à chaque voisin
+    local_ip: &str,
     original_lsa: &crate::types::LSAMessage,
-    path: Vec<String>,
-) -> crate::error::Result<()> {
+    mut path: Vec<String>,
+    state: &std::sync::Arc<crate::AppState>,
+) -> Result<()> {
     if original_lsa.ttl <= 1 {
         return Ok(());
     }
-    let message = crate::types::LSAMessage {
-        message_type: 2,
-        router_ip: router_ip.to_string(),
-        last_hop: Some(router_ip.to_string()),
-        originator: original_lsa.originator.clone(),
-        seq_num: original_lsa.seq_num,
-        neighbor_count: original_lsa.neighbor_count,
-        neighbors: original_lsa.neighbors.clone(),
-        routing_table: original_lsa.routing_table.clone(),
-        path,
-        ttl: original_lsa.ttl - 1,
-    };
-    let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
-    socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
-    info!("[FORWARD] LSA from {} (originator: {}, seq: {}) to {}", 
-          router_ip, original_lsa.originator, original_lsa.seq_num, addr);
+
+    // Ajoute notre IP au chemin
+    if !path.contains(&local_ip.to_string()) {
+        path.push(local_ip.to_string());
+    }
+
+    let neighbors = state.neighbors.lock().await;
+    for (neighbor_ip, neighbor) in neighbors.iter() {
+        // Ne pas relayer à soi-même, ni à l'expéditeur direct (last_hop)
+        if neighbor_ip == local_ip {
+            continue;
+        }
+        if let Some(last_hop) = &original_lsa.last_hop {
+            if neighbor_ip == last_hop {
+                continue;
+            }
+        }
+        if !neighbor.link_up {
+            continue;
+        }
+        // Empêcher la boucle : ne pas relayer si déjà dans le path
+        if path.contains(neighbor_ip) {
+            continue;
+        }
+        // Calculer l'adresse du voisin
+        let addr = format!("{}:{}", neighbor_ip, crate::PORT)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| AppError::NetworkError(format!("Invalid neighbor addr: {}", e)))?;
+
+        // Préparer le LSA à relayer
+        let message = crate::types::LSAMessage {
+            message_type: 2,
+            router_ip: local_ip.to_string(),
+            last_hop: Some(local_ip.to_string()),
+            originator: original_lsa.originator.clone(),
+            seq_num: original_lsa.seq_num,
+            neighbor_count: original_lsa.neighbor_count,
+            neighbors: original_lsa.neighbors.clone(),
+            routing_table: original_lsa.routing_table.clone(),
+            path: path.clone(),
+            ttl: original_lsa.ttl - 1,
+        };
+
+        crate::net_utils::send_message(socket, &addr, &message, state.key.as_slice(), "[FORWARD]").await?;
+        info!("[FORWARD] LSA from {} (originator: {}, seq: {}) to {}", 
+              local_ip, original_lsa.originator, original_lsa.seq_num, addr);
+    }
     Ok(())
 }
 
 pub async fn update_routing_from_lsa(
     state: std::sync::Arc<crate::AppState>,
     lsa: &crate::types::LSAMessage,
-    sender_ip: &str,
-    socket: &tokio::net::UdpSocket
-) -> crate::error::Result<()> {
-    let mut routing_table = state.routing_table.lock().await;
-    let next_hop = sender_ip.to_string();
-    if lsa.originator != state.local_ip {
-        let existing_entry = routing_table.get(&lsa.originator);
-        let should_update = match existing_entry {
-            Some((_, crate::types::RouteState::Active(current_metric))) => {
-                match lsa.routing_table.get(&lsa.originator) {
-                    Some(crate::types::RouteState::Active(new_metric)) => new_metric < current_metric,
-                    _ => false,
-                }
-            },
-            Some((_, crate::types::RouteState::Unreachable)) => true,
-            None => true,
-        };
-        if should_update {
-            let metric = match lsa.routing_table.get(&lsa.originator) {
-                Some(crate::types::RouteState::Active(m)) => *m + 1,
-                _ => 1,
-            };
-            routing_table.insert(lsa.originator.clone(), (next_hop.clone(), crate::types::RouteState::Active(metric)));
-            info!("Updated route: {} -> next_hop: {} (metric: {})", lsa.originator, next_hop, metric);
-            if let Err(e) = update_routing_table_safe(&lsa.originator, &next_hop).await {
-                warn!("Could not update system routing table for {}: {}", lsa.originator, e);
-            }
-        }
-    }
-    // Traiter les routes depuis la table de routage de la LSA (réseaux uniquement)
-    for (dest, route_state) in &lsa.routing_table {
-        // Ignorer les routes vers soi-même
-        if dest == &state.local_ip {
-            continue;
-        }
-        
-        // Ignorer les routes vers des IPs individuelles (ne traiter que les réseaux CIDR)
-        if !dest.contains('/') {
-            debug!("Skipping individual IP route: {}", dest);
-            continue;
-        }
-        
-        // Vérifier si c'est un réseau valide (pas une route vers une IP du même réseau local)
-        if let Ok(dest_network) = dest.parse::<pnet::ipnetwork::IpNetwork>() {
-            if let pnet::ipnetwork::IpNetwork::V4(dest_net) = dest_network {
-                // Vérifier si ce réseau est déjà directement connecté (éviter les doublons)
-                let interfaces = pnet::datalink::interfaces();
-                let mut is_local = false;
-                for iface in interfaces {
-                    for ip_network in iface.ips {
-                        if let pnet::ipnetwork::IpNetwork::V4(local_net) = ip_network {
-                            if dest_net.network() == local_net.network() && dest_net.prefix() == local_net.prefix() {
-                                is_local = true;
-                                break;
-                            }
-                        }
-                    }
-                    if is_local { break; }
-                }
-                
-                if is_local {
-                    debug!("Skipping route to local network: {}", dest);
-                    continue;
-                }
-            }
-        }
-        
-        match route_state {
-            crate::types::RouteState::Active(metric) => {
-                let existing_entry = routing_table.get(dest);
-                let new_metric = metric + 1;
-                let should_update = match existing_entry {
-                    Some((_, crate::types::RouteState::Active(current_metric))) => new_metric < *current_metric,
-                    Some((_, crate::types::RouteState::Unreachable)) => true,
-                    None => true,
-                };
-                if should_update {
-                    routing_table.insert(dest.clone(), (next_hop.clone(), RouteState::Active(new_metric)));
-                    info!("Learned network route from LSA: {} -> next_hop: {} (metric: {})", dest, next_hop, new_metric);
-                    if let Err(e) = update_routing_table_safe(dest, &next_hop).await {
-                        warn!("Could not update system routing table for {}: {}", dest, e);
-                    }
-                }
-            },
-            crate::types::RouteState::Unreachable => {
-                if let Some((current_next_hop, _)) = routing_table.get(dest) {
-                    if current_next_hop == &next_hop {
-                        routing_table.insert(dest.clone(), (next_hop.clone(), crate::types::RouteState::Unreachable));
-                        info!("Network route marked as unreachable: {}", dest);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    _sender_ip: &str,
+    _socket: &tokio::net::UdpSocket
+) -> Result<()> {
+    // Appeler le recalcul global des routes à chaque réception de LSA
+    crate::dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await
 }
 
 pub async fn send_poisoned_route(
@@ -231,8 +170,9 @@ pub async fn send_poisoned_route(
     router_ip: &str,
     poisoned_route: &str,
     seq_num: u32,
-    path: Vec<String>
-) -> crate::error::Result<()> {
+    path: Vec<String>,
+    state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
+) -> Result<()> {
     let mut routing_table = HashMap::new();
     routing_table.insert(poisoned_route.to_string(), crate::types::RouteState::Unreachable);
     let message = crate::types::LSAMessage {
@@ -247,13 +187,13 @@ pub async fn send_poisoned_route(
         path,
         ttl: super::INITIAL_TTL,
     };
-    let serialized = serde_json::to_vec(&message).map_err(crate::error::AppError::from)?;
-    socket.send_to(&serialized, addr).await.map_err(crate::error::AppError::from)?;
+    
+    crate::net_utils::send_message(socket, addr, &message, state.key.as_slice(), "[POISON]").await?;
     info!("[SEND] POISON ROUTE for {} from {} to {}", poisoned_route, router_ip, addr);
     Ok(())
 }
 
-pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crate::error::Result<()> {
+pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Result<()> {
     use pnet::ipnetwork::IpNetwork;
     use pnet::datalink;
     
@@ -263,15 +203,26 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
         return Ok(());
     }
     
+    // Analyser correctement le préfixe réseau pour obtenir l'adresse et la longueur du préfixe
     let network: IpNetwork = destination.parse()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
+        .map_err(|e| AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
+    
+    // Extraire le préfixe
+    let prefix_len = match network {
+        IpNetwork::V4(ipv4) => ipv4.prefix(),
+        IpNetwork::V6(ipv6) => ipv6.prefix(),
+    };
+    
     let gateway_ip: Ipv4Addr = gateway.parse()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
+        .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
+    
+    // Vérifications de base pour la passerelle
     if gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
         debug!("Skipping route to invalid gateway: {} via {}", destination, gateway);
         return Ok(());
     }
-    // Vérifier que la gateway est directement accessible (sur un réseau local)
+    
+    // Vérifier que la passerelle est directement accessible (sur un réseau local)
     let interfaces = datalink::interfaces();
     let mut gateway_is_local = false;
     let mut local_networks = Vec::new();
@@ -310,11 +261,11 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
         }
     }
     let handle = net_route::Handle::new()
-        .map_err(|e| crate::error::AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
+        .map_err(|e| AppError::RouteError(format!("Cannot create routing handle (permissions?): {}", e)))?;
     let (ip, prefix) = match network {
         IpNetwork::V4(net) => (IpAddr::V4(net.network()), net.prefix()),
         IpNetwork::V6(_) => {
-            return Err(crate::error::AppError::RouteError("IPv6 not supported".to_string()));
+            return Err(AppError::RouteError("IPv6 not supported".to_string()));
         }
     };
     let route = net_route::Route::new(ip, prefix as u8)
@@ -334,9 +285,52 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> crat
                 },
                 Err(e2) => {
                     warn!("Failed to add/update route to {} via {}: {}", destination, gateway_ip, e2);
-                    Err(crate::error::AppError::RouteError(format!("Routing update failed: {}", e2)))
+                    Err(AppError::RouteError(format!("Routing update failed: {}", e2)))
                 }
             }
+        }
+    }
+}
+
+// Modifier la fonction update_system_route pour accepter le préfixe
+async fn update_system_route(destination: &str, gateway: &str, prefix_len: u8) -> Result<()> {
+    use rtnetlink::{new_connection, IpVersion};
+    use std::net::Ipv4Addr;
+    use tokio::time::{timeout, Duration};
+
+    // Parse destination et gateway en IPv4
+    let parts: Vec<&str> = destination.split('/').collect();
+    let dest_ip: Ipv4Addr = parts[0].parse()
+        .map_err(|e| AppError::RouteError(format!("Destination IPv4 invalide: {}", e)))?;
+    
+    let gw_ip: Ipv4Addr = gateway.parse()
+        .map_err(|e| AppError::RouteError(format!("Gateway IPv4 invalide: {}", e)))?;
+
+    // Crée une connexion netlink
+    let (connection, handle, _) = new_connection()
+        .map_err(|e| AppError::RouteError(format!("Erreur netlink: {}", e)))?;
+    tokio::spawn(connection);
+
+    // Ajoute ou remplace la route avec le préfixe correct
+    let fut = handle.route().add()
+        .v4()
+        .destination_prefix(dest_ip, prefix_len)  // Utilise le préfixe correct
+        .gateway(gw_ip)
+        .execute();
+
+    // Timeout pour éviter de bloquer indéfiniment
+    match timeout(Duration::from_secs(2), fut).await {
+        Ok(Ok(_)) => {
+            debug!("Route système mise à jour: {} via {}", destination, gateway);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            warn!("Erreur netlink lors de la mise à jour de la route: {}", e);
+            Err(AppError::RouteError(format!("Erreur netlink: {}", e)))
+        }
+        Err(_) => {
+            warn!("Timeout netlink lors de la mise à jour de la route");
+            Err(AppError::RouteError("Timeout netlink".into()))
         }
     }
 }

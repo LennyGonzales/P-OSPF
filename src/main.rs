@@ -1,13 +1,12 @@
+use routing_project::*;
+
 mod types;
-mod error;
-mod net_utils;
 mod neighbor;
 mod lsa;
 mod init;
 mod tasks;
 mod packet_loop;
 mod hello;
-mod read_config;
 mod dijkstra;
 
 use error::*;
@@ -38,8 +37,9 @@ pub struct AppState {
     pub routing_table: Mutex<HashMap<String, (String, RouteState)>>,
     pub processed_lsa: Mutex<HashSet<(String, u32)>>,
     pub local_ip: String,
-    pub enabled: Mutex<bool>, // État d'activation du protocole OSPF
-    pub config: read_config::RouterConfig, // Configuration du routeur
+    pub enabled: Mutex<bool>,
+    pub config: read_config::RouterConfig,
+    pub key: Vec<u8>,
 }
 
 impl AppState {
@@ -62,10 +62,10 @@ impl AppState {
 }
 
 const PORT: u16 = 5000;
-const HELLO_INTERVAL_SEC: u64 = 20;
-const LSA_INTERVAL_SEC: u64 = 30;
-const NEIGHBOR_TIMEOUT_SEC: u64 = 60;
-const INITIAL_TTL: u8 = 64;
+const HELLO_INTERVAL_SEC: u64 = 5;
+const LSA_INTERVAL_SEC: u64 = 10;
+const NEIGHBOR_TIMEOUT_SEC: u64 = 22;
+const INITIAL_TTL: u8 = 15;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -76,17 +76,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     info!("Configuration chargée pour le routeur avec {} interfaces", config.interfaces.len());
     
     let router_ip = get_local_ip()?;
-    info!("Router IP: {}", router_ip);
+    info!("Hostname: {}", hostname::get()?.to_string_lossy());
     let socket = init_socket(PORT).await?;
-    let state = init_state(router_ip, config);
+    let key = config.key
+        .as_ref()
+        .map(|k| base64::decode(k).unwrap_or_else(|_| k.as_bytes().to_vec()))
+        .unwrap_or_else(|| vec![0u8; 32]); // fallback si pas de clé
+    let state = init_state(router_ip.clone(), config, key);
     
     // Calculer les routes initiales
-    if let Err(e) = dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await {
+    if let Err(e) = dijkstra::calculate_and_update_optimal_routes(Arc::clone(&state)).await {
         warn!("Échec du calcul initial des routes: {}", e);
     }
     
-    spawn_hello_and_lsa_tasks(std::sync::Arc::clone(&socket), std::sync::Arc::clone(&state));
-    spawn_neighbor_timeout_task(std::sync::Arc::clone(&state));
+    spawn_hello_and_lsa_tasks(Arc::clone(&socket), Arc::clone(&state));
+    spawn_neighbor_timeout_task(Arc::clone(&state));
     
     main_loop(socket, state).await?;
     Ok(())

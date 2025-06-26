@@ -1,8 +1,11 @@
 [package]
 name = "routing_project"
-version = "0.1.0"
-edition = "2021"
-authors = ["GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>"]
+version = "1.0.0"
+edition = "2025"
+authors = [
+    "GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>",
+    "SAADI Nils <nils.saadi@etu.mines-ales.fr>"
+]
 license = "MIT"
 description = "A simple OSPF router implemented in Rust"
 homepage = "https://github.com/LennyGonzales/P-OSPF"
@@ -10,6 +13,7 @@ repository = "https://github.com/LennyGonzales/P-OSPF"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 net-route = "0.4"
@@ -18,7 +22,12 @@ log = "0.4"
 pnet = "0.33"
 hostname = "0.3"
 toml = "0.8"
-
+aes = "0.8"
+cbc = "0.1"
+rand = "0.8"
+base64 = "0.22.1"
+cipher = "0.4.4"
+rtnetlink = "0.13"
 
 [[bin]]
 name = "routing"

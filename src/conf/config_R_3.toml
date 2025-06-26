@@ -1,9 +1,11 @@
 [[interfaces]]
 name = "eth0"
-capacity_mbps = 1000  # t_A3
+capacity_mbps = 50  # t_A3
 link_active = true
 
 [[interfaces]]
 name = "eth1"
-capacity_mbps = 1000    # R_5
+capacity_mbps = 50    # R_5
 link_active = true
+
+key = "1Jq4357rFRYk/GdtFN0qTlE7Q7BVv7NMcuD2+wDqZD3JWB7/RWALAoY6aVxlyo/K"
