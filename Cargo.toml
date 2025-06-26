@@ -1,8 +1,11 @@
 [package]
 name = "routing_project"
-version = "0.1.0"
-edition = "2021"
-authors = ["GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>"]
+version = "1.0.0"
+edition = "2025"
+authors = [
+    "GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>",
+    "SAADI Nils <nils.saadi@etu.mines-ales.fr>"
+]
 license = "MIT"
 description = "A simple OSPF router implemented in Rust"
 homepage = "https://github.com/LennyGonzales/P-OSPF"

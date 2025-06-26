@@ -54,7 +54,7 @@ Lorsqu'un routeur reçoit un paquet LSA :
 3. Si le LSA est nouveau ou plus récent, il le relaie à tous ses voisins sauf celui qui l'a envoyé (flooding).
 4. Après mise à jour de la topologie, il relance l'algorithme de Dijkstra pour recalculer les routes optimales.
 
-###'# Forward des LSA
+#### Forward des LSA
 Lorsqu’un routeur reçoit un LSA nouveau ou plus récent, il :
 1. Met à jour sa base de topologie
 2. Relaye (forward) ce LSA à tous ses voisins sauf celui qui l’a envoyé

@@ -68,7 +68,7 @@ P-OSPF intègre une tolérance aux pannes basée sur :
 Le protocole P-OSPF est conçu pour être léger et efficace :
 - **CPU** : la charge processeur reste faible en fonctionnement normal, l’algorithme de Dijkstra n’étant relancé qu’en cas de changement de topologie.
 - **Mémoire** : l’empreinte mémoire dépend du nombre de voisins et de la taille de la topologie, mais reste modérée (stockage des LSA, voisins, table de routage).
-- **Réseau** : le trafic généré est principalement constitué de paquets HELLO et LSA, dont la taille est réduite. Le flooding des LSA est limité par la détection des doublons et la propagation sélective.
+- **Réseau** : le trafic généré est principalement constitué de paquets HELLO et LSA, dont la taille est réduite. Le flooding des LSA est limité par la détection des doublons et la propagation sélective. Un message HELLO fait typiquement 40 à 80 octets (JSON + chiffrement), un message LSA entre 400 et 900 octets selon la topologie (nombre de voisins/routes). Ces tailles restent très faibles par rapport à la MTU Ethernet (1500 octets), donc aucun risque de fragmentation.
 
 ## 4. Robustesse et fiabilité
 
