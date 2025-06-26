@@ -4,7 +4,6 @@ use tokio::net::UdpSocket;
 use log::info;
 use std::net::SocketAddr;
 
-/// Envoie un message Hello pour découvrir des voisins
 pub async fn send_hello(socket: &UdpSocket, addr: &SocketAddr, router_ip: &str, key: &[u8]) -> Result<()> {
     let message = HelloMessage {
         message_type: 1,

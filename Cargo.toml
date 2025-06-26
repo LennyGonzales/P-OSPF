@@ -1,7 +1,7 @@
 [package]
 name = "routing_project"
 version = "1.0.0"
-edition = "2025"
+edition = "2021"
 authors = [
     "GONZALES Lenny <lenny.gonzales@etu.mines-ales.fr>",
     "SAADI Nils <nils.saadi@etu.mines-ales.fr>"
