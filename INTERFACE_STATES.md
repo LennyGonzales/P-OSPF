@@ -68,18 +68,6 @@ Coût = 100 000 000 / (capacité_en_bps)
 - Calcul dynamique de la capacité des liens depuis la configuration
 - Mise à jour automatique basée sur les timeouts OSPF standard
 
-### 3. Affichage des Informations
-
-Fonctions disponibles pour l'affichage :
-
-```rust
-// Afficher l'état des interfaces
-neighbor::display_interface_report(&state).await;
-
-// Tester les fonctionnalités
-interface_test::test_interface_states(state).await;
-```
-
 ## Utilisation
 
 ### 1. Configuration

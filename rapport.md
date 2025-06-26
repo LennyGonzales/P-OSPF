@@ -8,7 +8,7 @@ Nils Saadi - INFRES 17 DL
 
 Le projet **P-OSPF** (Open Shortest Path First Protocol) est une implémentation simplifiée d’un protocole de routage dynamique inspiré d’OSPF. Il permet à des routeurs de découvrir dynamiquement la topologie du réseau, de calculer les plus courts chemins entre nœuds, de mettre à jour leurs tables de routage, d’interagir via une interface CLI, et d’assurer la sécurité des échanges par chiffrement.
 
-Le programme est structuré en plusieurs modules : gestion des paquets, découverte de voisins, calcul de routes (Dijkstra), lecture de configuration, CLI, etc. Chaque routeur lit sa configuration, découvre ses voisins, échange des informations de topologie, calcule les routes optimales, et met à jour sa table de routage en conséquence.
+Le programme est structuré en plusieurs modules : gestion des paquets, découverte de voisins, calcul de routes (Dijkstra), lecture de configuration, CLI, ... Chaque routeur lit sa configuration, découvre ses voisins, échange des informations de topologie, calcule les routes optimales, et met à jour sa table de routage en conséquence.
 
 ---
 

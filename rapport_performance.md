@@ -10,19 +10,19 @@ Le projet utilise la crate `log` avec `env_logger` pour la gestion des logs. Les
 - **info** : événements majeurs (démarrage, envoi/réception de messages, chargement de configuration)
 - **debug** : détails sur la topologie, paquets reçus, calculs intermédiaires
 - **warn** : situations anormales mais non bloquantes
-- **error** : erreurs critiques (échec d'envoi, déchiffrement, etc.)
+- **error** : erreurs critiques (échec d'envoi, déchiffrement, ...)
 
-Les logs sont présents dans tous les modules critiques : découverte de voisins, gestion des paquets, calcul de routes, lecture de configuration, etc.
+Les logs sont présents dans tous les modules critiques : découverte de voisins, gestion des paquets, calcul de routes, lecture de configuration, ...
 
 ### 1.1. Type de log
 
 - **[FORWARD]** : Relais d’un paquet LSA à d’autres routeurs. Permet de suivre la propagation des informations de topologie dans le réseau.
 - **[SEND]** : Envoi d’un message (HELLO, LSA, ou commande) vers un voisin ou un autre routeur. Utile pour tracer l’activité sortante du routeur.
-- **[RECV]** : Réception d’un message (HELLO, LSA, etc.) depuis un voisin. Permet de suivre l’activité entrante et la découverte de nouveaux événements réseau.
-- **[CLI]** : Interactions via l’interface en ligne de commande (commandes utilisateur, affichage d’état, etc.). Permet de distinguer les actions manuelles ou de debug.
+- **[RECV]** : Réception d’un message (HELLO, LSA, ...) depuis un voisin. Permet de suivre l’activité entrante et la découverte de nouveaux événements réseau.
+- **[CLI]** : Interactions via l’interface en ligne de commande (commandes utilisateur, affichage d’état, ...). Permet de distinguer les actions manuelles ou de debug.
 
 
-## 2. Performence
+## 2. Performance
 
 ### 2.1. Temps de découverte du réseau
 
