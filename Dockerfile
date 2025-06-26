@@ -17,8 +17,11 @@ RUN cargo build --release
 
 FROM frolvlad/alpine-glibc:alpine-3.12
 
-COPY --from=builder /usr/src/myapp/target/release/routing_project /usr/local/bin/routing_project
+COPY --from=builder /usr/src/myapp/target/release/routing /usr/local/bin/routing
+COPY --from=builder /usr/src/myapp/src/conf /usr/local/bin/src/conf
+
+WORKDIR /usr/local/bin
 
 EXPOSE 8080
 
-CMD ["routing_project"]
+CMD ["routing"]
