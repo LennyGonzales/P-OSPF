@@ -1,6 +1,3 @@
-// Fonctions liées à la gestion des messages LSA et routage
-
-// Nettoyage : suppression des imports inutilisés
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -13,7 +10,7 @@ pub async fn update_topology(state: Arc<crate::AppState>, lsa: &crate::types::LS
 
     let router_state = topology.entry(lsa.originator.clone()).or_insert_with(crate::types::Router::new);
 
-    // Ne mettre à jour que si le nouveau LSA est plus récent
+    // Met à jour si le nouveau LSA est plus récent
     if router_state.last_lsa.as_ref().map_or(true, |old_lsa| lsa.seq_num > old_lsa.seq_num) {
         router_state.last_lsa = Some(lsa.clone());
         debug!("Updated topology for originator {}", lsa.originator);
@@ -43,7 +40,6 @@ pub async fn send_lsa(
     }
     drop(routing_table_guard);
     
-    // Propager les réseaux selon les bonnes pratiques OSPF
     use pnet::datalink;
     use pnet::ipnetwork::IpNetwork;
     let interfaces = datalink::interfaces();
@@ -56,8 +52,6 @@ pub async fn send_lsa(
                 if !ip.is_loopback() && !ip.is_unspecified() {
                     let network_cidr = ipv4_network.to_string();
                     
-                    // - Propager les réseaux de cœur (backbone) : 10.x.x.x
-                    // - Propager AUSSI les réseaux d'accès pour la démo : 192.168.x.x
                     if ip.octets()[0] == 10 {
                         route_states.insert(network_cidr.clone(), crate::types::RouteState::Active(0));
                         debug!("Router {} advertising backbone network {}", router_ip, network_cidr);
@@ -71,7 +65,6 @@ pub async fn send_lsa(
         }
     }
     
-    // Les routeurs d'accès propagent aussi une route par défaut
     if has_access_network {
         route_states.insert("0.0.0.0/0".to_string(), crate::types::RouteState::Active(20));
         debug!("Access router {} advertising default route", router_ip);
@@ -95,7 +88,7 @@ pub async fn send_lsa(
 
 pub async fn forward_lsa(
     socket: &tokio::net::UdpSocket,
-    _broadcast_addr: &std::net::SocketAddr, // ignoré, on envoie unicast à chaque voisin
+    _broadcast_addr: &std::net::SocketAddr,
     local_ip: &str,
     original_lsa: &crate::types::LSAMessage,
     mut path: Vec<String>,
@@ -105,14 +98,12 @@ pub async fn forward_lsa(
         return Ok(());
     }
 
-    // Ajoute notre IP au chemin
     if !path.contains(&local_ip.to_string()) {
         path.push(local_ip.to_string());
     }
 
     let neighbors = state.neighbors.lock().await;
     for (neighbor_ip, neighbor) in neighbors.iter() {
-        // Ne pas relayer à soi-même, ni à l'expéditeur direct (last_hop)
         if neighbor_ip == local_ip {
             continue;
         }
@@ -124,16 +115,15 @@ pub async fn forward_lsa(
         if !neighbor.link_up {
             continue;
         }
-        // Empêcher la boucle : ne pas relayer si déjà dans le path
+
         if path.contains(neighbor_ip) {
             continue;
         }
-        // Calculer l'adresse du voisin
+
         let addr = format!("{}:{}", neighbor_ip, crate::PORT)
             .parse::<std::net::SocketAddr>()
             .map_err(|e| AppError::NetworkError(format!("Invalid neighbor addr: {}", e)))?;
 
-        // Préparer le LSA à relayer
         let message = crate::types::LSAMessage {
             message_type: 2,
             router_ip: local_ip.to_string(),
@@ -160,7 +150,6 @@ pub async fn update_routing_from_lsa(
     _sender_ip: &str,
     _socket: &tokio::net::UdpSocket
 ) -> Result<()> {
-    // Appeler le recalcul global des routes à chaque réception de LSA
     crate::dijkstra::calculate_and_update_optimal_routes(std::sync::Arc::clone(&state)).await
 }
 
@@ -171,7 +160,7 @@ pub async fn send_poisoned_route(
     poisoned_route: &str,
     seq_num: u32,
     path: Vec<String>,
-    state: &std::sync::Arc<crate::AppState>, // Ajout du state pour accéder à la clé
+    state: &std::sync::Arc<crate::AppState>,
 ) -> Result<()> {
     let mut routing_table = HashMap::new();
     routing_table.insert(poisoned_route.to_string(), crate::types::RouteState::Unreachable);
@@ -197,17 +186,14 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Resu
     use pnet::ipnetwork::IpNetwork;
     use pnet::datalink;
     
-    // Vérifier si c'est une route vers un réseau (CIDR) ou une IP individuelle
     if !destination.contains('/') {
         debug!("Skipping route to individual IP (not a network): {}", destination);
         return Ok(());
     }
     
-    // Analyser correctement le préfixe réseau pour obtenir l'adresse et la longueur du préfixe
     let network: IpNetwork = destination.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid destination network {}: {}", destination, e)))?;
     
-    // Extraire le préfixe
     let prefix_len = match network {
         IpNetwork::V4(ipv4) => ipv4.prefix(),
         IpNetwork::V6(ipv6) => ipv6.prefix(),
@@ -216,13 +202,11 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Resu
     let gateway_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Invalid gateway IP {}: {}", gateway, e)))?;
     
-    // Vérifications de base pour la passerelle
     if gateway_ip.is_loopback() || gateway_ip.is_unspecified() {
         debug!("Skipping route to invalid gateway: {} via {}", destination, gateway);
         return Ok(());
     }
     
-    // Vérifier que la passerelle est directement accessible (sur un réseau local)
     let interfaces = datalink::interfaces();
     let mut gateway_is_local = false;
     let mut local_networks = Vec::new();
@@ -247,7 +231,6 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Resu
         return Ok(());
     }
     
-    // Vérification supplémentaire : éviter d'ajouter une route vers son propre réseau
     if let IpNetwork::V4(dest_net) = network {
         for iface in datalink::interfaces() {
             for ip_network in iface.ips {
@@ -292,13 +275,11 @@ pub async fn update_routing_table_safe(destination: &str, gateway: &str) -> Resu
     }
 }
 
-// Modifier la fonction update_system_route pour accepter le préfixe
 async fn update_system_route(destination: &str, gateway: &str, prefix_len: u8) -> Result<()> {
     use rtnetlink::{new_connection, IpVersion};
     use std::net::Ipv4Addr;
     use tokio::time::{timeout, Duration};
 
-    // Parse destination et gateway en IPv4
     let parts: Vec<&str> = destination.split('/').collect();
     let dest_ip: Ipv4Addr = parts[0].parse()
         .map_err(|e| AppError::RouteError(format!("Destination IPv4 invalide: {}", e)))?;
@@ -306,19 +287,16 @@ async fn update_system_route(destination: &str, gateway: &str, prefix_len: u8) -
     let gw_ip: Ipv4Addr = gateway.parse()
         .map_err(|e| AppError::RouteError(format!("Gateway IPv4 invalide: {}", e)))?;
 
-    // Crée une connexion netlink
     let (connection, handle, _) = new_connection()
         .map_err(|e| AppError::RouteError(format!("Erreur netlink: {}", e)))?;
     tokio::spawn(connection);
 
-    // Ajoute ou remplace la route avec le préfixe correct
     let fut = handle.route().add()
         .v4()
-        .destination_prefix(dest_ip, prefix_len)  // Utilise le préfixe correct
+        .destination_prefix(dest_ip, prefix_len)
         .gateway(gw_ip)
         .execute();
 
-    // Timeout pour éviter de bloquer indéfiniment
     match timeout(Duration::from_secs(2), fut).await {
         Ok(Ok(_)) => {
             debug!("Route système mise à jour: {} via {}", destination, gateway);

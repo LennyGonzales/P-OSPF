@@ -1,5 +1,3 @@
-// Gestion des erreurs personnalisées
-
 use std::fmt;
 use std::error::Error as StdError;
 
