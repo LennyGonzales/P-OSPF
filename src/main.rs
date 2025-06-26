@@ -43,19 +43,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Active le protocole OSPF
     pub async fn enable(&self) {
         let mut enabled = self.enabled.lock().await;
         *enabled = true;
     }
     
-    /// Désactive le protocole OSPF
     pub async fn disable(&self) {
         let mut enabled = self.enabled.lock().await;
         *enabled = false;
     }
     
-    /// Vérifie si le protocole OSPF est activé
     pub async fn is_enabled(&self) -> bool {
         *self.enabled.lock().await
     }
@@ -84,7 +81,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| vec![0u8; 32]); // fallback si pas de clé
     let state = init_state(router_ip.clone(), config, key);
     
-    // Calculer les routes initiales
     if let Err(e) = dijkstra::calculate_and_update_optimal_routes(Arc::clone(&state)).await {
         warn!("Échec du calcul initial des routes: {}", e);
     }

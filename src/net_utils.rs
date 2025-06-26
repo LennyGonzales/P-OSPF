@@ -1,5 +1,3 @@
-// Fonctions utilitaires réseau et helpers
-
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use pnet::datalink::{self, NetworkInterface};
@@ -81,17 +79,6 @@ pub fn calculate_broadcast_for_interface(interface_ip: &str, ip_network: &IpNetw
     }
 }
 
-/// Fonction générique pour envoyer n'importe quel type de message sérialisable
-/// 
-/// # Arguments
-/// * `socket` - Le socket UDP à utiliser pour l'envoi
-/// * `addr` - L'adresse de destination
-/// * `message` - Le message à envoyer (doit implémenter Serialize)
-/// * `message_type` - Type du message (1: HELLO, 2: LSA, 3: Commande)
-/// * `log_prefix` - Préfixe pour les logs (ex: "[SEND]", "[CLI]")
-/// 
-/// # Returns
-/// * `Result<()>` - Ok si le message a été envoyé, Err sinon
 pub async fn send_message<T: serde::Serialize>(
     socket: &tokio::net::UdpSocket,
     addr: &std::net::SocketAddr,
@@ -111,22 +98,14 @@ pub async fn send_message<T: serde::Serialize>(
     Ok(())
 }
 
-/// Chiffre les données en utilisant AES-256-CBC et génère un IV aléatoire.
-///
-/// # Arguments
-/// * `data` - Les données en clair à chiffrer.
-/// * `key` - La clé de 32 octets.
-///
-/// # Returns
-/// * `Result<Vec<u8>>` - Les données chiffrées avec l'IV préfixé.
+
 pub fn encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
-    // Vérifier que la clé fait 32 octets (256 bits)
     if key.len() != 32 {
         return Err(AppError::CryptoError("La clé doit faire 32 octets".to_string()));
     }
     
     // Générer un IV aléatoire
-    let mut iv = vec![0u8; 16]; // AES utilise toujours un bloc de 16 octets
+    let mut iv = vec![0u8; 16];
     OsRng.fill_bytes(&mut iv);
     
     // Convertir le slice en tableau de taille fixe pour aes/cbc
@@ -135,9 +114,7 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     let iv_array: &[u8; 16] = iv.as_slice().try_into()
         .map_err(|_| AppError::CryptoError("Erreur de conversion d'IV".to_string()))?;
     
-    // Chiffrer les données
     let encryptor = Encryptor::<Aes256>::new(key_array.into(), iv_array.into());
-    // Allouer un buffer pour les données + padding maximal possible
     let block_size = 16;
     let padding = block_size - (data.len() % block_size);
     let mut buffer = Vec::with_capacity(data.len() + padding);
@@ -156,14 +133,7 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Déchiffre les données en utilisant AES-256-CBC.
-///
-/// # Arguments
-/// * `ciphertext` - Les données chiffrées à déchiffrer (IV préfixé).
-/// * `key` - La clé de 32 octets.
-///
-/// # Returns
-/// * `Result<Vec<u8>>` - Les données en clair.
+
 pub fn decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     // Vérifier que la clé fait 32 octets (256 bits)
     if key.len() != 32 {

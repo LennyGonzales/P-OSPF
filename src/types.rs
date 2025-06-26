@@ -1,5 +1,3 @@
-// Définitions des structures et enums partagées
-
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 
@@ -32,7 +30,7 @@ pub struct LSAMessage {
     pub seq_num: u32,
     pub neighbor_count: usize,
     pub neighbors: Vec<Neighbor>,
-    pub routing_table: HashMap<String, RouteState>, // Clé = préfixe réseau CIDR (ex: "10.2.0.0/24")
+    pub routing_table: HashMap<String, RouteState>,
     pub path: Vec<String>,
     pub ttl: u8,
 }
@@ -73,7 +71,6 @@ impl InterfaceState {
         }
     }
     
-    /// Met à jour l'état du lien
     pub fn set_link_state(&mut self, active: bool) {
         if self.link_active != active {
             self.link_active = active;
@@ -84,7 +81,6 @@ impl InterfaceState {
         }
     }
     
-    /// Vérifie si le lien est actif
     pub fn is_link_up(&self) -> bool {
         self.link_active
     }

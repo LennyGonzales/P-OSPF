@@ -1,5 +1,3 @@
-// Module de lecture de configuration basé sur le hostname
-
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -50,7 +48,6 @@ pub fn read_router_config() -> Result<RouterConfig> {
     Ok(config)
 }
 
-/// Obtient le hostname de la machine
 fn get_hostname() -> Result<String> {
     hostname::get()
         .map_err(|e| AppError::ConfigError(format!("Failed to get hostname: {}", e)))?
@@ -62,7 +59,6 @@ fn get_hostname() -> Result<String> {
         .map(|s| s.to_string())
 }
 
-/// Liste les fichiers de configuration disponibles
 fn list_available_configs() -> String {
     let config_dir = "src/conf";
     if let Ok(entries) = fs::read_dir(config_dir) {

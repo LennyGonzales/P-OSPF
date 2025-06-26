@@ -1,11 +1,9 @@
-// Fonctions liées à la gestion des voisins
-
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use log::{info, warn, error};
 use crate::AppState;
 use std::time::Duration;
-use crate::dijkstra::{self, calculate_ospf_cost}; // Ajout de 'self' pour importer le module lui-même
+use crate::dijkstra::{self, calculate_ospf_cost};
 
 use crate::net_utils::get_broadcast_addresses;
 
@@ -15,7 +13,6 @@ pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs();
     
-    // Obtenir les informations de l'interface pour ce voisin
     let (capacity, link_active) = get_interface_info_for_neighbor(state, neighbor_ip).await;
     
     let mut neighbors = state.neighbors.lock().await;
@@ -23,8 +20,7 @@ pub async fn update_neighbor(state: &Arc<crate::AppState>, neighbor_ip: &str) {
         .and_modify(|n| {
             n.last_seen = current_time;
             n.capacity = capacity;
-            // Le lien n'est considéré comme UP que si l'interface est active ET le voisin répond
-            let should_be_up = link_active; // true car on a reçu un message du voisin
+            let should_be_up = link_active;
             if n.link_up != should_be_up {
                 if should_be_up {
                     info!("Neighbor {} is now UP (capacity: {} Mbps)", neighbor_ip, capacity);
@@ -90,9 +86,6 @@ pub async fn check_neighbor_timeouts(state: &Arc<AppState>) {
 
 /// Détermine la capacité et l'état d'une interface pour un voisin donné
 async fn get_interface_info_for_neighbor(state: &Arc<AppState>, neighbor_ip: &str) -> (u32, bool) {
-    // Pour l'instant, on utilise la première interface active configurée
-    // Dans une implémentation plus avancée, on pourrait déterminer l'interface
-    // en fonction de l'adresse IP du voisin et des réseaux configurés
     
     for interface in &state.config.interfaces {
         if interface.link_active {
@@ -104,7 +97,7 @@ async fn get_interface_info_for_neighbor(state: &Arc<AppState>, neighbor_ip: &st
     if let Some(interface) = state.config.interfaces.first() {
         (interface.capacity_mbps, interface.link_active)
     } else {
-        (100, false) // Valeurs par défaut
+        (100, false)
     }
 }
 

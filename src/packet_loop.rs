@@ -1,11 +1,9 @@
-// Imports pour les macros de logging
 use log::{info, warn, debug, error};
 
 pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std::sync::Arc<crate::AppState>) -> crate::error::Result<()> {
     let mut buf = [0u8; 4096];
     let (size, src_addr) = socket.recv_from(&mut buf).await?;
 
-    // Déchiffrement du message reçu
     let decrypted = match crate::net_utils::decrypt(&buf[..size], state.key.as_slice()) {
         Ok(data) => data,
         Err(e) => {
@@ -39,7 +37,6 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
         }
         log::debug!("Received {} bytes from {}", len, src_addr);
         
-        // Déchiffrer le message avant de le traiter
         let decrypted = match crate::net_utils::decrypt(&buf[..len], state.key.as_slice()) {
             Ok(data) => data,
             Err(e) => {
@@ -58,7 +55,6 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
         
         log::debug!("Receiving interface IP: {}, Network: {}", receiving_interface_ip, receiving_network);
         
-        // Utiliser les données déchiffrées pour la désérialisation
         match serde_json::from_slice::<serde_json::Value>(&decrypted) {
             Ok(json) => {
                 if let Some(message_type) = json.get("message_type").and_then(|v| v.as_u64()) {
@@ -76,7 +72,7 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                                     hello.router_ip, src_addr, receiving_interface_ip);
                                 crate::neighbor::update_neighbor(&state, &hello.router_ip).await;
                                 // Utiliser le préfixe réseau de l'interface pour la table de routage
-                                let network_prefix = receiving_network.to_string(); // ex: "10.2.0.0/24"
+                                let network_prefix = receiving_network.to_string();
                                 let broadcast_addr = crate::net_utils::calculate_broadcast_for_interface(&receiving_interface_ip, &receiving_network, crate::PORT)?;
                                 let seq_num = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -141,7 +137,6 @@ pub async fn main_loop(socket: std::sync::Arc<tokio::net::UdpSocket>, state: std
                             }
                         }
                         3 => {
-                            // Message de contrôle : enable/disable
                             if let Some(command) = json.get("command").and_then(|v| v.as_str()) {
                                 log::info!("[CLI] Received control command from {}: {}", src_addr, command);
                                 match command {
